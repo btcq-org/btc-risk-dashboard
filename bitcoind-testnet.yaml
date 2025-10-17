@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bitcoind-testnet
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bitcoind-testnet
+  template:
+    metadata:
+      labels:
+        app: bitcoind-testnet
+    spec:
+      containers:
+      - name: bitcoind
+        image: ruimarinho/bitcoin-core:latest
+        args:
+          - "-testnet"
+          - "-rpcallowip=0.0.0.0/0"
+          - "-rpcbind=0.0.0.0"
+          - "-rpcuser=admin"
+          - "-rpcpassword=pass"
+          - "-datadir=/bitcoin"
+          - "-txindex=1"
+        ports:
+          - containerPort: 18332 # RPC
+          - containerPort: 18333 # P2P
+        volumeMounts:
+          - name: bitcoin-data
+            mountPath: /data
+      volumes:
+        - name: bitcoin-data
+          persistentVolumeClaim:
+            claimName: bitcoin-testnet-pvc
