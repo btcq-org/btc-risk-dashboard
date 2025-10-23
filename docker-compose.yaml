@@ -1,0 +1,46 @@
+version: '1'
+
+services:
+  bitcoind-testnet:
+    image: ruimarinho/bitcoin-core:latest
+    command:
+      - "-testnet"
+      - "-rpcallowip=0.0.0.0/0"
+      - "-rpcbind=0.0.0.0"
+      - "-rpcuser=admin"
+      - "-rpcpassword=pass"
+      - "-datadir=/bitcoin"
+      - "-txindex=1"
+      # - "-stopatheight=631000"
+      - "-connect=0"
+    ports:
+      - 18332:18332
+      - 18333:18333
+
+  pg:
+    image: timescale/timescaledb:2.13.0-pg15
+    shm_size: 512m
+    command: postgres -c plan_cache_mode=force_custom_plan
+    environment:
+      - POSTGRES_DB=postgres
+      - POSTGRES_USER=indexer
+      - POSTGRES_PASSWORD=password
+    ports:
+      - 5432:5432
+    volumes:
+      - pg:/var/lib/postgresql/data
+  
+  indexer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: indexer
+    ports:
+      - 8080:8080
+    links:
+      - pg
+    depends_on:
+      - pg
+
+volumes:
+  pg:

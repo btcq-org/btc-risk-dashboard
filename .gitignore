@@ -6,6 +6,7 @@
 .Trashes
 ehthumbs.db
 Thumbs.db
+**/__pycache__/
 
 # IDE files
 .idea/
@@ -25,4 +26,4 @@ build/
 *.log
 
 # Data files
-quantum_*.csv
+data/
