@@ -94,13 +94,10 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
         # Compute block timestamp in nanoseconds for hypertable
         block_time = block.get('time', 0)
         block_ts = int(block_time * 1_000_000_000)
-        local_exposed, local_revealed = [], []
         local_addr_updates = {}
         
         for tx in block.get("tx", []):
-            exp, rev, addr_meta = analyze_tx(tx, height, block_ts)
-            local_exposed.extend(exp)
-            local_revealed.extend(rev)
+            addr_meta = analyze_tx(tx, height, block_ts)
             # Merge address metadata updates
             for addr, meta in addr_meta.items():
                 if addr not in local_addr_updates:
@@ -117,11 +114,8 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                         existing["script_sig_type"] = meta["script_sig_type"]
 
         with lock:
-            out_lists['exposed'].extend(local_exposed)
-            out_lists['revealed'].extend(local_revealed)
             # Merge block's address updates into global list
-            if 'address_updates' not in out_lists:
-                out_lists['address_updates'] = {}
+            out_lists['address_updates'] = {}
             for addr, meta in local_addr_updates.items():
                 if addr not in out_lists['address_updates']:
                     out_lists['address_updates'][addr] = meta.copy()
@@ -173,39 +167,15 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
 
         # Gather per-chunk data
         address_updates = out_lists.get('address_updates', {})
-        scanned_blocks = out_lists.get('scanned', [])
-        exposed_rows_raw = out_lists.get('exposed', [])
-        revealed_rows_raw = out_lists.get('revealed', [])
-
-        # Deduplicate exposed/revealed rows by address within this chunk to avoid
-        # inserting the same primary key multiple times in one bulk insert
-        exposed_map = {}
-        for r in exposed_rows_raw:
-            addr = r.get('address')
-            if not addr:
-                continue
-            # prefer the earliest block height in the chunk for this address
-            if addr not in exposed_map or r.get('block_height', 0) < exposed_map[addr]['block_height']:
-                exposed_map[addr] = r
-
-        revealed_map = {}
-        for r in revealed_rows_raw:
-            addr = r.get('address')
-            if not addr:
-                continue
-            if addr not in revealed_map or r.get('block_height', 0) < revealed_map[addr]['block_height']:
-                revealed_map[addr] = r
-
-        exposed_rows = list(exposed_map.values())
-        revealed_rows = list(revealed_map.values())
+        block_logs = out_lists.get('scanned', [])
 
         # Write this chunk's results to DB
         try:
             with db.get_db_cursor() as cur:
                 # Batch insert block log
-                if scanned_blocks:
+                if block_logs:
                     block_vals = [(b['block_height'], b['block_hash'], b.get('block_timestamp', 0))
-                                 for b in scanned_blocks]
+                                 for b in block_logs]
                     db.execute_values(cur,
                         """
                         INSERT INTO block_log (block_height, block_hash, block_timestamp) VALUES %s
@@ -258,15 +228,14 @@ def is_pubkey_hex(s):
     return ((s.startswith("02") or s.startswith("03")) and len(s) == 66) or \
            (s.startswith("04") and len(s) == 130)
 
+
 def analyze_tx(tx, height, block_ts):
     """Analyze a transaction JSON object from getblock(...,2).
     
     Returns:
-        tuple: (exposed addresses, revealed addresses, address metadata updates)
+        tuple: (address metadata updates)
         where address metadata includes script types, balance changes, etc.
     """
-    exposed = []
-    revealed = []
     address_updates = {}  # address -> {first_seen, last_seen, script types, balance change}
 
     # Check outputs (exposed pubkeys and track balances)
@@ -301,6 +270,7 @@ def analyze_tx(tx, height, block_ts):
         # Add more as needed
         return t
 
+    address = ""
     for vout in tx.get("vout", []):
         spk = vout.get("scriptPubKey", {})
         address = spk.get("address", "")
@@ -338,14 +308,6 @@ def analyze_tx(tx, height, block_ts):
             except Exception:
                 address = ""
 
-        # Track exposed pubkeys
-        if script_type in ("P2PK", "P2TR"):
-            exposed.append({
-                "block_height": height,
-                "txid": tx["txid"],
-                "address": address,
-            })
-
         # Update address metadata if we have an address
         if address:
             addr_meta = address_updates.setdefault(address, {
@@ -367,6 +329,7 @@ def analyze_tx(tx, height, block_ts):
     for vin in tx.get("vin", []):
         if "txid" not in vin:
             continue
+
         scriptsig = vin.get("scriptSig", {})
         scriptsig_asm = scriptsig.get("asm", "")
         scriptsig_type = scriptsig.get("type", "")
@@ -376,6 +339,7 @@ def analyze_tx(tx, height, block_ts):
         value_sat = int(float(vin.get("prevout", {}).get("value", 0)) * 100_000_000)
 
         # Look for revealed pubkeys in scriptSig and witness
+        # Reused addresses
         if any(is_pubkey_hex(x) for x in scriptsig_asm.split()):
             revealed_keys.extend([x for x in scriptsig_asm.split() if is_pubkey_hex(x)])
         if any(is_pubkey_hex(x) for x in witness):
@@ -395,12 +359,6 @@ def analyze_tx(tx, height, block_ts):
                             address = str(P2PKHBitcoinAddress.from_pubkey(pubkey))
                     else:
                         address = str(P2PKHBitcoinAddress.from_pubkey(pubkey))
-
-                    revealed.append({
-                        "block_height": height,
-                        "txid": tx["txid"],
-                        "address": address,
-                    })
 
                     # Update address metadata for the revealed key
                     addr_meta = address_updates.setdefault(address, {
@@ -435,7 +393,7 @@ def analyze_tx(tx, height, block_ts):
             addr_meta["balance_sat"] -= value_sat
             addr_meta["tx_count"] += 1
 
-    return exposed, revealed, address_updates
+    return address_updates
 
 
 # ========================
