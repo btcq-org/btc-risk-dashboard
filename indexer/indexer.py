@@ -27,7 +27,7 @@ RPC_URL = f"http://127.0.0.1:{RPC_PORT}/"
 
 SelectParams(NETWORK)
 
-THREADS = 8               # number of parallel workers
+THREADS = 8              # number of parallel workers
 INITIAL_BLOCKS = 100     # number of historical blocks to scan on startup
 POLL_INTERVAL = 1.0      # seconds between checking for new blocks
 RECONNECT_DELAY = 5.0    # seconds to wait after connection error
@@ -59,10 +59,10 @@ def is_pubkey_hex(s):
            (s.startswith("04") and len(s) == 130)
 
 def get_last_processed_height():
-    """Get the highest block we've processed from quantum_scanned."""
+    """Get the highest block we've processed from block_log."""
     try:
         with db.get_db_cursor() as cur:
-            cur.execute("SELECT MAX(block_height) FROM quantum_scanned")
+            cur.execute("SELECT MAX(block_height) FROM block_log")
             row = cur.fetchone()
             return row[0] if row and row[0] is not None else 0
     except Exception as e:
@@ -91,21 +91,55 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
             print(f"Error reading block {height}: {e}")
             failed_blocks.append(height)
             return
-
+        # Compute block timestamp in nanoseconds for hypertable
+        block_time = block.get('time', 0)
+        block_ts = int(block_time * 1_000_000_000)
         local_exposed, local_revealed = [], []
+        local_addr_updates = {}
+        
         for tx in block.get("tx", []):
-            exp, rev = analyze_tx(tx, height)
+            exp, rev, addr_meta = analyze_tx(tx, height, block_ts)
             local_exposed.extend(exp)
             local_revealed.extend(rev)
+            # Merge address metadata updates
+            for addr, meta in addr_meta.items():
+                if addr not in local_addr_updates:
+                    local_addr_updates[addr] = meta.copy()
+                else:
+                    existing = local_addr_updates[addr]
+                    existing["first_seen_block"] = min(existing["first_seen_block"], meta["first_seen_block"])
+                    existing["last_seen_block"] = max(existing["last_seen_block"], meta["last_seen_block"])
+                    existing["tx_count"] += meta["tx_count"]
+                    existing["balance_sat"] += meta["balance_sat"]
+                    if meta["script_pub_type"]:
+                        existing["script_pub_type"] = meta["script_pub_type"]
+                    if meta["script_sig_type"]:
+                        existing["script_sig_type"] = meta["script_sig_type"]
 
         with lock:
             out_lists['exposed'].extend(local_exposed)
             out_lists['revealed'].extend(local_revealed)
+            # Merge block's address updates into global list
+            if 'address_updates' not in out_lists:
+                out_lists['address_updates'] = {}
+            for addr, meta in local_addr_updates.items():
+                if addr not in out_lists['address_updates']:
+                    out_lists['address_updates'][addr] = meta.copy()
+                else:
+                    existing = out_lists['address_updates'][addr]
+                    existing["first_seen_block"] = min(existing["first_seen_block"], meta["first_seen_block"])
+                    existing["last_seen_block"] = max(existing["last_seen_block"], meta["last_seen_block"])
+                    existing["tx_count"] += meta["tx_count"]
+                    existing["balance_sat"] += meta["balance_sat"]
+                    if meta["script_pub_type"]:
+                        existing["script_pub_type"] = meta["script_pub_type"]
+                    if meta["script_sig_type"]:
+                        existing["script_sig_type"] = meta["script_sig_type"]
+            
             out_lists['scanned'].append({
                 "block_height": height,
                 "block_hash": blockhash,
-                "exposed_count": len(local_exposed),
-                "revealed_count": len(local_revealed)
+                "block_timestamp": block_ts
             })
 
     # iterate chunks
@@ -137,47 +171,84 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
         if to_process:
             print(f"❌ Failed to process blocks after {MAX_RETRIES} retries in chunk {chunk_start}–{chunk_end}: {to_process}")
 
-        # Filter out any empty addresses (don't insert empty string keys)
-        exposed_rows = [r for r in out_lists['exposed'] if r.get('address')]
-        revealed_rows = [r for r in out_lists['revealed'] if r.get('address')]
-        scanned_blocks = out_lists['scanned']
+        # Gather per-chunk data
+        address_updates = out_lists.get('address_updates', {})
+        scanned_blocks = out_lists.get('scanned', [])
+        exposed_rows_raw = out_lists.get('exposed', [])
+        revealed_rows_raw = out_lists.get('revealed', [])
+
+        # Deduplicate exposed/revealed rows by address within this chunk to avoid
+        # inserting the same primary key multiple times in one bulk insert
+        exposed_map = {}
+        for r in exposed_rows_raw:
+            addr = r.get('address')
+            if not addr:
+                continue
+            # prefer the earliest block height in the chunk for this address
+            if addr not in exposed_map or r.get('block_height', 0) < exposed_map[addr]['block_height']:
+                exposed_map[addr] = r
+
+        revealed_map = {}
+        for r in revealed_rows_raw:
+            addr = r.get('address')
+            if not addr:
+                continue
+            if addr not in revealed_map or r.get('block_height', 0) < revealed_map[addr]['block_height']:
+                revealed_map[addr] = r
+
+        exposed_rows = list(exposed_map.values())
+        revealed_rows = list(revealed_map.values())
 
         # Write this chunk's results to DB
         try:
             with db.get_db_cursor() as cur:
-                # Batch insert exposed_rows
-                if exposed_rows:
-                    exposed_vals = [(r['block_height'], r['txid'], r['address'])
-                                    for r in exposed_rows]
-                    db.execute_values(cur,
-                                   "INSERT INTO quantum_exposed (block_height, txid, address) VALUES %s "
-                                   "ON CONFLICT (address) DO NOTHING",
-                                   exposed_vals)
-
-                # Batch insert revealed_rows
-                if revealed_rows:
-                    revealed_vals = [(r['block_height'], r['txid'], r['address'])
-                                     for r in revealed_rows]
-                    db.execute_values(cur,
-                                   "INSERT INTO quantum_revealed (block_height, txid, address) VALUES %s "
-                                   "ON CONFLICT (address) DO NOTHING",
-                                   revealed_vals)
-
-                # Batch insert scanned blocks (upsert counts)
+                # Batch insert block log
                 if scanned_blocks:
-                    scanned_vals = [(b['block_height'], b.get('block_hash',''), b.get('exposed_count',0), b.get('revealed_count',0))
-                                    for b in scanned_blocks]
+                    block_vals = [(b['block_height'], b['block_hash'], b.get('block_timestamp', 0))
+                                 for b in scanned_blocks]
                     db.execute_values(cur,
-                                   "INSERT INTO quantum_scanned (block_height, block_hash, exposed_count, revealed_count) VALUES %s "
-                                   "ON CONFLICT (block_height) DO UPDATE SET block_hash = EXCLUDED.block_hash, "
-                                   "exposed_count = EXCLUDED.exposed_count, revealed_count = EXCLUDED.revealed_count",
-                                   scanned_vals)
+                        """
+                        INSERT INTO block_log (block_height, block_hash, block_timestamp) VALUES %s
+                        ON CONFLICT (block_height, block_timestamp) DO UPDATE SET
+                            block_hash = EXCLUDED.block_hash,
+                            scanned_at = DEFAULT
+                        """,
+                        block_vals)
+
+                # Batch insert/update address metadata
+                if address_updates:
+                    addr_vals = [(
+                        addr,  # address
+                        meta.get('first_seen_block'),  # first_seen_block
+                        meta.get('last_seen_block'),   # last_seen_block
+                        meta.get('tx_count', 1),       # tx_count
+                        meta.get('script_pub_type'),   # script_pub_type
+                        meta.get('script_sig_type'),   # script_sig_type
+                        meta.get('balance_sat', 0),    # balance_sat
+                        meta.get('block_timestamp', 0) # block_timestamp (ns)
+                    ) for addr, meta in address_updates.items()]
+                    db.execute_values(cur,
+                        """
+                        INSERT INTO addresses 
+                        (address, first_seen_block, last_seen_block, tx_count, 
+                         script_pub_type, script_sig_type, balance_sat, block_timestamp)
+                        VALUES %s
+                        ON CONFLICT (address, block_timestamp) DO UPDATE SET
+                            first_seen_block = LEAST(addresses.first_seen_block, EXCLUDED.first_seen_block),
+                            last_seen_block = GREATEST(addresses.last_seen_block, EXCLUDED.last_seen_block),
+                            tx_count = addresses.tx_count + EXCLUDED.tx_count,
+                            script_pub_type = COALESCE(EXCLUDED.script_pub_type, addresses.script_pub_type),
+                            script_sig_type = COALESCE(EXCLUDED.script_sig_type, addresses.script_sig_type),
+                            balance_sat = addresses.balance_sat + EXCLUDED.balance_sat
+                        """,
+                        addr_vals)
+
         except Exception as e:
             print(f"Error writing chunk {chunk_start}-{chunk_end} to PostgreSQL: {e}")
         # Shutdown pool to flush all connections and data to disk
         db.shutdown_pool()
         # Print summary for this chunk
-        print(f"✅ Saved and flushed chunk {chunk_start}–{chunk_end} to disk: {len(exposed_rows)} exposed, {len(revealed_rows)} revealed, {len(scanned_blocks)} blocks.")
+        print(f"✅ Saved and flushed chunk {chunk_start}–{chunk_end}")
 
 # ========================
 # ANALYSIS
@@ -187,16 +258,56 @@ def is_pubkey_hex(s):
     return ((s.startswith("02") or s.startswith("03")) and len(s) == 66) or \
            (s.startswith("04") and len(s) == 130)
 
-def analyze_tx(tx, height):
-    """Analyze a transaction JSON object from getblock(...,2)."""
-    exposed, revealed = [], []
+def analyze_tx(tx, height, block_ts):
+    """Analyze a transaction JSON object from getblock(...,2).
+    
+    Returns:
+        tuple: (exposed addresses, revealed addresses, address metadata updates)
+        where address metadata includes script types, balance changes, etc.
+    """
+    exposed = []
+    revealed = []
+    address_updates = {}  # address -> {first_seen, last_seen, script types, balance change}
 
-    # Check outputs (exposed pubkeys)
-    # Check outputs (exposed pubkeys)
+    # Check outputs (exposed pubkeys and track balances)
+    def detect_script_type(spk):
+        """
+        Detect scriptPubKey type for common and rare types.
+        Covers: P2PK, P2PKH, P2SH, P2MS, P2WPKH, P2WSH, P2TR, OP_RETURN, NULLDATA, nonstandard, witness_v1_taproot, etc.
+        """
+        if not spk:
+            return None
+        t = spk.get("type")
+        # Common types
+        if t == "pubkey":
+            return "P2PK"
+        if t == "pubkeyhash":
+            return "P2PKH"
+        if t == "scripthash":
+            return "P2SH"
+        if t == "multisig":
+            return "P2MS"
+        if t == "witness_v0_keyhash":
+            return "P2WPKH"
+        if t == "witness_v0_scripthash":
+            return "P2WSH"
+        if t == "v1_p2tr" or t == "witness_v1_taproot":
+            return "P2TR"
+        # Other types
+        if t == "nulldata" or t == "op_return":
+            return "OP_RETURN"
+        if t == "nonstandard":
+            return "nonstandard"
+        # Add more as needed
+        return t
+
     for vout in tx.get("vout", []):
         spk = vout.get("scriptPubKey", {})
-        stype = spk.get("type")
         address = spk.get("address", "")
+        value_sat = int(float(vout.get("value", 0)) * 100_000_000)
+
+        script_type = detect_script_type(spk)
+
         # Try to decode address if missing
         if not address and "hex" in spk:
             try:
@@ -207,7 +318,7 @@ def analyze_tx(tx, height):
                 except Exception:
                     address = ""
                 # If still missing and it's a raw pubkey output, extract pubkey and derive address
-                if not address and stype == "pubkey":
+                if not address and script_type == "P2PK":
                     for item in script:
                         # script elements that are bytes may be pubkey
                         if isinstance(item, (bytes, bytearray)) and len(item) in (33, 65):
@@ -226,26 +337,51 @@ def analyze_tx(tx, height):
                                 continue
             except Exception:
                 address = ""
-        if stype in ("pubkey", "v1_p2tr"):
+
+        # Track exposed pubkeys
+        if script_type in ("P2PK", "P2TR"):
             exposed.append({
                 "block_height": height,
                 "txid": tx["txid"],
                 "address": address,
             })
 
-    # Check inputs (revealed pubkeys)
+        # Update address metadata if we have an address
+        if address:
+            addr_meta = address_updates.setdefault(address, {
+                "first_seen_block": height,
+                "last_seen_block": height,
+                "tx_count": 1,
+                "script_pub_type": script_type,
+                "script_sig_type": None,
+                "balance_sat": 0,
+                "block_timestamp": block_ts
+            })
+            addr_meta["last_seen_block"] = max(height, addr_meta["last_seen_block"])
+            addr_meta["balance_sat"] += value_sat
+            # Keep most recent scriptPubKey type
+            if script_type:
+                addr_meta["script_pub_type"] = script_type
+
+    # Check inputs (revealed pubkeys and track spends)
     for vin in tx.get("vin", []):
         if "txid" not in vin:
             continue
-        scriptsig = vin.get("scriptSig", {}).get("asm", "")
+        scriptsig = vin.get("scriptSig", {})
+        scriptsig_asm = scriptsig.get("asm", "")
+        scriptsig_type = scriptsig.get("type", "")
         witness = vin.get("txinwitness", [])
         revealed_keys = []
+        prev_addr = vin.get("prevout", {}).get("scriptPubKey", {}).get("address", "")
+        value_sat = int(float(vin.get("prevout", {}).get("value", 0)) * 100_000_000)
 
-        if any(is_pubkey_hex(x) for x in scriptsig.split()):
-            revealed_keys.extend([x for x in scriptsig.split() if is_pubkey_hex(x)])
+        # Look for revealed pubkeys in scriptSig and witness
+        if any(is_pubkey_hex(x) for x in scriptsig_asm.split()):
+            revealed_keys.extend([x for x in scriptsig_asm.split() if is_pubkey_hex(x)])
         if any(is_pubkey_hex(x) for x in witness):
             revealed_keys.extend([x for x in witness if is_pubkey_hex(x)])
 
+        # Process revealed keys and track metadata
         if revealed_keys:
             for pubkey_hex in revealed_keys:
                 try:
@@ -265,10 +401,41 @@ def analyze_tx(tx, height):
                         "txid": tx["txid"],
                         "address": address,
                     })
+
+                    # Update address metadata for the revealed key
+                    addr_meta = address_updates.setdefault(address, {
+                        "first_seen_block": height,
+                        "last_seen_block": height,
+                        "tx_count": 1,
+                        "script_pub_type": None,
+                        "script_sig_type": scriptsig_type,
+                        "balance_sat": 0,
+                        "block_timestamp": block_ts
+                    })
+                    addr_meta["last_seen_block"] = max(height, addr_meta["last_seen_block"])
+                    addr_meta["tx_count"] += 1
+                    if scriptsig_type:
+                        addr_meta["script_sig_type"] = scriptsig_type
+
                 except Exception as e:
                     print(f"Error converting pubkey to address: {e}")
 
-    return exposed, revealed
+        # Update balance for spent outputs if we have the previous address
+        if prev_addr:
+            addr_meta = address_updates.setdefault(prev_addr, {
+                "first_seen_block": height,
+                "last_seen_block": height,
+                "tx_count": 1,
+                "script_pub_type": None,
+                "script_sig_type": None,
+                "balance_sat": 0,
+                "block_timestamp": block_ts
+            })
+            addr_meta["last_seen_block"] = max(height, addr_meta["last_seen_block"])
+            addr_meta["balance_sat"] -= value_sat
+            addr_meta["tx_count"] += 1
+
+    return exposed, revealed, address_updates
 
 
 # ========================
@@ -295,7 +462,7 @@ def monitor_blocks():
         if last_processed > 0:
             try:
                 with db.get_db_cursor() as cur:
-                    cur.execute("SELECT block_hash FROM quantum_scanned WHERE block_height = %s", (last_processed,))
+                    cur.execute("SELECT block_hash FROM block_log WHERE block_height = %s", (last_processed,))
                     row = cur.fetchone()
                     if row and row[0]:
                         indexed_hash = row[0]
@@ -313,9 +480,9 @@ def monitor_blocks():
             process_range(0, chain_tip)
             last_processed = chain_tip
         # Otherwise catch up from our last processed to current tip
-        elif last_processed < chain_tip:
-            process_range(last_processed + 1, chain_tip)
-            last_processed = chain_tip
+        # elif last_processed < chain_tip:
+        #     process_range(last_processed + 1, chain_tip)
+        #     last_processed = chain_tip
 
         print(f"\n✅ Initial sync complete. Monitoring for new blocks from height {last_processed}...")
 
@@ -327,7 +494,7 @@ def monitor_blocks():
                 # First verify our last processed block is still valid
                 if last_processed > 0:
                     with db.get_db_cursor() as cur:
-                        cur.execute("SELECT block_hash FROM quantum_scanned WHERE block_height = %s", (last_processed,))
+                        cur.execute("SELECT block_hash FROM block_log WHERE block_height = %s", (last_processed,))
                         row = cur.fetchone()
                         if row and row[0]:
                             indexed_hash = row[0]
@@ -373,7 +540,6 @@ def schema_init():
         db.shutdown_pool()
 
 def main():
-    print("Starting quantum-at-risk indexer...")
     schema_init()
     monitor_blocks()
 

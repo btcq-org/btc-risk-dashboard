@@ -8,7 +8,9 @@ from indexer.db import get_db_cursor
 TABLES = [
     "quantum_exposed",
     "quantum_revealed",
-    "quantum_scanned"
+    "quantum_scanned",
+    "block_log",
+    "addresses"
 ]
 
 def nuke_tables():
