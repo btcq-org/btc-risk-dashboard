@@ -20,9 +20,12 @@ import struct
 import sys
 from collections import defaultdict
 from typing import Dict
+from bitcoin.core import CScript
+from bitcoin.wallet import CBitcoinAddress
+from bitcoin import SelectParams
+from pycoin.symbols.btc import network
 
-
-
+SelectParams('mainnet')
 
 def _read_exact(f, n: int) -> bytes:
     data = f.read(n)
@@ -60,6 +63,28 @@ def read_varint(f) -> int:
         else:
             return result
     raise ValueError("Too big read_varint")
+
+def decompress_amount(x) -> int:
+    if x == 0:
+        return 0
+
+    x -= 1
+    e = x % 10
+    x /= 10
+    n = 0
+    if e < 9:
+        d = (x % 9) + 1
+        x /= 9
+        n = x * 10 + d
+    else:
+        n = x + 1
+    
+    while e > 0:
+        n *= 10
+        e -= 1
+    
+    return n
+
 
 def classify_script(script: bytes) -> str:
     """
@@ -137,6 +162,7 @@ def read_utxo_file(filename: str) -> None:
             print(f"Expected: {expected_header_start.hex()}")
             print(f"Actual:   {actual_header_start.hex()}")
 
+        # This loop reads grouped UTXO records
         while parsed_utxos < num_utxos:
             # txid: 32 bytes (LE)
             txid_bytes = f.read(32)
@@ -144,42 +170,64 @@ def read_utxo_file(filename: str) -> None:
                 raise ValueError("File too short for txid")
 
             # num_outputs: CompactSize
-            num_outputs = read_compactsize(f)
+            coins_per_hash = read_compactsize(f)
 
-            for _ in range(num_outputs):
+            if parsed_utxos >= 1:
+                return
+
+            for i in range(coins_per_hash):
                 if parsed_utxos >= num_utxos:
                     raise ValueError("More UTXOs parsed than announced")
 
-                # vout: uint32 LE
-                vout_data = f.read(4)
-                if len(vout_data) < 4:
-                    raise ValueError("File too short for vout")
-                vout = struct.unpack('<I', vout_data)[0]
+                print(f"Reading {txid_bytes[::-1].hex()} output {i}")
 
-                # height: uint32 LE
-                height_data = f.read(4)
-                if len(height_data) < 4:
-                    raise ValueError("File too short for height")
-                height = struct.unpack('<I', height_data)[0]
+                height = read_compactsize(f)
+                code = f.read(3)
+                amount = decompress_amount(read_varint(f))
 
-                # amount: int64 LE (satoshis)
-                amount_data = f.read(8)
-                if len(amount_data) < 8:
-                    raise ValueError("File too short for amount")
-                amount_sat = struct.unpack('<q', amount_data)[0]
+                print(f"  height: {height}, amount: {amount} satoshis")
 
-                # script_len: CompactSize
-                script_len = read_compactsize(f)
+                # size = read_varint(f)
+                # print(f"  script size: {size} bytes")
+                
+                scriptpubkey = f.read(32)
+                print(scriptpubkey.hex())
+                address = network.address.for_script(bytes.fromhex('41047a488354d9d5414de09b7121b80b973c991b76998ad68756d8cf4560c0ddcbe24ae72a77cca86f6d1d11b1b796e3f14caa5852e6d4c60e9bebedc71673b58ec0ac'))
+                print(f"  address: {address}")
+                # intersting = read_scriptpubkey(f)
 
-                # scriptPubKey: script_len bytes
-                script = f.read(script_len)
-                if len(script) < script_len:
-                    raise ValueError("File too short for scriptPubKey")
+                # # vout: uint32 LE
+                # vout_data = f.read(4)
+                # if len(vout_data) < 4:
+                #     raise ValueError("File too short for vout")
+                # vout = struct.unpack('<I', vout_data)[0]
+
+                # print(f"  vout: {vout}")
+
+                # # height: uint32 LE
+                # height_data = f.read(4)
+                # if len(height_data) < 4:
+                #     raise ValueError("File too short for height")
+                # height = struct.unpack('<I', height_data)[0]
+
+                # # amount: int64 LE (satoshis)
+                # amount_data = f.read(8)
+                # if len(amount_data) < 8:
+                #     raise ValueError("File too short for amount")
+                # amount_sat = struct.unpack('<q', amount_data)[0]
+
+                # # script_len: CompactSize
+                # script_len = read_compactsize(f)
+
+                # # scriptPubKey: script_len bytes
+                # script = f.read(script_len)
+                # if len(script) < script_len:
+                #     raise ValueError("File too short for scriptPubKey")
 
                 # Classify type
-                utxo_type = classify_script(script)
-                type_stats[utxo_type]['count'] += 1
-                type_stats[utxo_type]['total_sat'] += amount_sat
+                # utxo_type = classify_script(script)
+                # type_stats[utxo_type]['count'] += 1
+                # type_stats[utxo_type]['total_sat'] += amount_sat
 
                 parsed_utxos += 1
 
