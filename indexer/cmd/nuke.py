@@ -6,11 +6,8 @@ Nuke all quantum-at-risk tables in the PostgreSQL database.
 from indexer.db import get_db_cursor
 
 TABLES = [
-    "quantum_exposed",
-    "quantum_revealed",
-    "quantum_scanned",
     "block_log",
-    "addresses"
+    "utxos"
 ]
 
 def nuke_tables():

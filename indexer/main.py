@@ -125,7 +125,6 @@ def is_pubkey_hex(s):
 def address_from_vin(vin):
     """Extract address from vin entry if possible"""
     scriptsig_asm = vin.get("scriptSig", {}).get("asm", "")
-    scriptsig_type = vin.get("scriptSig", {}).get("type", "")
 
     prevout = vin.get("prevout", {})
     prev_addr = prevout.get("scriptPubKey", {}).get("address", "")
@@ -316,7 +315,7 @@ def schema_init():
         db.shutdown_pool()
 
 # ========================
-# Range processing (mirrors indexer.py style)
+# Range processing
 # ========================
 def get_last_processed_height():
     try:
