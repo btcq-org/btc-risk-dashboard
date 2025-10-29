@@ -1,18 +1,20 @@
 version: '1'
 
 services:
-  bitcoind-testnet:
-    image: ruimarinho/bitcoin-core:latest
+  bitcoind:
+    image: bitcoin/bitcoin:latest
     command:
-      - "-testnet"
+      - "-printtoconsole"
       - "-rpcallowip=0.0.0.0/0"
       - "-rpcbind=0.0.0.0"
       - "-rpcuser=admin"
       - "-rpcpassword=pass"
-      - "-datadir=/bitcoin"
-      - "-txindex=1"
-      # - "-stopatheight=631000"
+      - "-txindex=0"
+      - "-rpcport=18332"
+      # - "-stopatheight=100000"
       - "-connect=0"
+      # - "-maxconnections=0"
+      # - "-daemon"
     ports:
       - 18332:18332
       - 18333:18333
@@ -30,17 +32,17 @@ services:
     volumes:
       - pg:/var/lib/postgresql/data
   
-  indexer:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: indexer
-    ports:
-      - 8080:8080
-    links:
-      - pg
-    depends_on:
-      - pg
+  # indexer:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   image: indexer
+  #   ports:
+  #     - 8080:8080
+  #   links:
+  #     - pg
+  #   depends_on:
+  #     - pg
 
 volumes:
   pg:
