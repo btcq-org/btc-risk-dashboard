@@ -101,3 +101,36 @@ def latest_blocks(limit: int = Query(20, ge=1, le=100)):
         return {"results": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/address")
+def address_utxo_stats(q: str = Query(..., min_length=1)):
+    """
+    For the given address, return UTXO stats: total_utxos, spent_utxos, unspent_utxos, spent_value_sat, unspent_value_sat, total_value_sat.
+    Only returns data for addresses having at least 2 UTXOs with both spent AND unspent present.
+    """
+    try:
+        with db.get_db_cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT
+                  address,
+                  COUNT(*) AS total_utxos,
+                  COUNT(*) FILTER (WHERE spent) AS spent_utxos,
+                  COUNT(*) FILTER (WHERE NOT spent) AS unspent_utxos,
+                  SUM(value_sat) FILTER (WHERE spent) AS spent_value_sat,
+                  SUM(value_sat) FILTER (WHERE NOT spent) AS unspent_value_sat,
+                  SUM(value_sat) AS total_value_sat
+                FROM utxos
+                WHERE address = %s
+                GROUP BY address
+                HAVING COUNT(*) >= 2
+                   AND COUNT(*) FILTER (WHERE spent) >= 1
+                   AND COUNT(*) FILTER (WHERE NOT spent) >= 1
+                LIMIT 1;
+            """, (q,))
+            row = cur.fetchone()
+            if row:
+                return row
+            else:
+                raise HTTPException(status_code=404, detail=f"No stats found for address: {q}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
