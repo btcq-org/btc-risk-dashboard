@@ -24,7 +24,8 @@ def nuke_schema():
         tables = [
             "addresses",
             "block_log",
-            "utxos"
+            "utxos",
+            "schema_initialized"
         ]
         for table in tables:
             print(f"Dropping table: {table}")

@@ -128,10 +128,27 @@ def schema_init():
     db.init_pool()
     try:
         with db.get_db_cursor() as cur:
+            # Check if block_log table exists (indicates schema is already initialized)
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_schema = 'public' 
+                    AND table_name = 'block_log'
+                )
+            """)
+            table_exists = cur.fetchone()[0]
+            
+            if table_exists:
+                print("Schema already initialized (block_log table exists), skipping initialization.")
+                return
+            
+            # Schema not initialized, run the SQL
+            print("Initializing database schema...")
             try:
                 with open(schema_path, "r") as sf:
                     schema_sql = sf.read()
                 cur.execute(schema_sql)
+                print("Schema initialization completed.")
             except FileNotFoundError:
                 raise
     finally:
@@ -229,6 +246,7 @@ def process_single_block(height):
                 vout_start = time.time()
                 vout_count = len(vout_rows)
                 print(f"[Block {height}] Inserting {vout_count} UTXOs...")
+                # Use execute_values for faster bulk inserts (uses COPY internally)
                 execute_values(cur,
                     """
                     INSERT INTO utxos (txid, vout, address, value_sat, script_pub_key_hex, script_pub_type, created_block, created_block_timestamp)
@@ -250,6 +268,7 @@ def process_single_block(height):
                 vin_start = time.time()
                 vin_count = len(vin_rows)
                 print(f"[Block {height}] Updating {vin_count} spent UTXOs...")
+                # Use execute_batch for UPDATEs (execute_values doesn't support UPDATE well)
                 execute_batch(cur,
                     """
                     UPDATE utxos
@@ -278,6 +297,9 @@ def process_single_block(height):
             print(f"[Block {height}] Inserted block_log in {block_log_time:.3f}s")
             
             # Refresh address_status materialized view periodically
+            # REFRESH_INTERVAL > 0: refresh every N blocks
+            # REFRESH_INTERVAL = 0: refresh every block (expensive)
+            # REFRESH_INTERVAL < 0: never refresh automatically
             _blocks_since_refresh += 1
             if REFRESH_INTERVAL > 0:
                 if _blocks_since_refresh >= REFRESH_INTERVAL:
@@ -490,7 +512,7 @@ def main():
     # Initialize database pool once at startup
     db.init_pool()
     
-    # schema_init()
+    schema_init()
     last = get_last_processed_height()
     
     # Initial catch-up: process from last_processed to current tip
