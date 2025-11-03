@@ -17,7 +17,7 @@ import sys
 import os
 
 import psycopg2
-from psycopg2.extras import execute_batch
+from psycopg2.extras import execute_batch, execute_values
 from . import db
 
 from pycoin.symbols.btc import network
@@ -226,10 +226,13 @@ def process_single_block(height):
         print(f"[Block {height}] Starting database write...")
         with db.get_db_cursor() as cur:
             if vout_rows:
-                execute_batch(cur,
+                vout_start = time.time()
+                vout_count = len(vout_rows)
+                print(f"[Block {height}] Inserting {vout_count} UTXOs...")
+                execute_values(cur,
                     """
                     INSERT INTO utxos (txid, vout, address, value_sat, script_pub_key_hex, script_pub_type, created_block, created_block_timestamp)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES %s
                     ON CONFLICT (txid, vout) DO UPDATE SET
                         address = EXCLUDED.address,
                         value_sat = EXCLUDED.value_sat,
@@ -238,10 +241,15 @@ def process_single_block(height):
                         created_block = EXCLUDED.created_block,
                         created_block_timestamp = EXCLUDED.created_block_timestamp
                     """,
-                    vout_rows, page_size=500
+                    vout_rows, page_size=1000, template=None
                 )
+                vout_time = time.time() - vout_start
+                print(f"[Block {height}] Inserted {vout_count} UTXOs in {vout_time:.3f}s")
             
             if vin_rows:
+                vin_start = time.time()
+                vin_count = len(vin_rows)
+                print(f"[Block {height}] Updating {vin_count} spent UTXOs...")
                 execute_batch(cur,
                     """
                     UPDATE utxos
@@ -252,10 +260,13 @@ def process_single_block(height):
                         spent_block_timestamp = %s
                     WHERE txid = %s AND vout = %s AND (spent IS DISTINCT FROM TRUE)
                     """,
-                    vin_rows, page_size=500
+                    vin_rows, page_size=1000
                 )
+                vin_time = time.time() - vin_start
+                print(f"[Block {height}] Updated {vin_count} spent UTXOs in {vin_time:.3f}s")
             
             # Insert block log entry
+            block_log_start = time.time()
             cur.execute(
                 """
                 INSERT INTO block_log (block_height, block_hash, block_timestamp)
@@ -263,11 +274,10 @@ def process_single_block(height):
                 """,
                 (height, blockhash, block_ts)
             )
+            block_log_time = time.time() - block_log_start
+            print(f"[Block {height}] Inserted block_log in {block_log_time:.3f}s")
             
             # Refresh address_status materialized view periodically
-            # REFRESH_INTERVAL > 0: refresh every N blocks
-            # REFRESH_INTERVAL = 0: refresh every block (expensive)
-            # REFRESH_INTERVAL < 0: never refresh automatically
             _blocks_since_refresh += 1
             if REFRESH_INTERVAL > 0:
                 if _blocks_since_refresh >= REFRESH_INTERVAL:
@@ -387,10 +397,14 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
             print(f"[Chunk {chunk_start}-{chunk_end}] Starting database write...")
             with db.get_db_cursor() as cur:
                 if out_lists['vout_rows']:
-                    execute_batch(cur,
+                    vout_start = time.time()
+                    vout_count = len(out_lists['vout_rows'])
+                    print(f"[Chunk {chunk_start}-{chunk_end}] Inserting {vout_count} UTXOs...")
+                    # Use execute_values for faster bulk inserts (uses COPY internally)
+                    execute_values(cur,
                         """
                         INSERT INTO utxos (txid, vout, address, value_sat, script_pub_key_hex, script_pub_type, created_block, created_block_timestamp)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        VALUES %s
                         ON CONFLICT (txid, vout) DO UPDATE SET
                             address = EXCLUDED.address,
                             value_sat = EXCLUDED.value_sat,
@@ -399,10 +413,16 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                             created_block = EXCLUDED.created_block,
                             created_block_timestamp = EXCLUDED.created_block_timestamp
                         """,
-                        out_lists['vout_rows'], page_size=500
+                        out_lists['vout_rows'], page_size=1000, template=None
                     )
+                    vout_time = time.time() - vout_start
+                    print(f"[Chunk {chunk_start}-{chunk_end}] Inserted {vout_count} UTXOs in {vout_time:.3f}s")
 
                 if out_lists['vin_rows']:
+                    vin_start = time.time()
+                    vin_count = len(out_lists['vin_rows'])
+                    print(f"[Chunk {chunk_start}-{chunk_end}] Updating {vin_count} spent UTXOs...")
+                    # Use execute_batch for UPDATEs (execute_values doesn't support UPDATE well)
                     execute_batch(cur,
                         """
                         UPDATE utxos
@@ -413,17 +433,24 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                             spent_block_timestamp = %s
                         WHERE txid = %s AND vout = %s AND (spent IS DISTINCT FROM TRUE)
                         """,
-                        out_lists['vin_rows'], page_size=500
+                        out_lists['vin_rows'], page_size=1000
                     )
+                    vin_time = time.time() - vin_start
+                    print(f"[Chunk {chunk_start}-{chunk_end}] Updated {vin_count} spent UTXOs in {vin_time:.3f}s")
 
                 if out_lists['scanned']:
+                    block_log_start = time.time()
+                    block_count = len(out_lists['scanned'])
                     block_vals = [(b['block_height'], b['block_hash'], b['block_timestamp']) for b in out_lists['scanned']]
+                    print(f"[Chunk {chunk_start}-{chunk_end}] Inserting {block_count} block_log entries...")
                     db.execute_values(cur,
                         """
                         INSERT INTO block_log (block_height, block_hash, block_timestamp) VALUES %s
                         """,
                         block_vals
                     )
+                    block_log_time = time.time() - block_log_start
+                    print(f"[Chunk {chunk_start}-{chunk_end}] Inserted {block_count} block_log entries in {block_log_time:.3f}s")
                 
                 # Refresh address_status materialized view after each chunk during catch-up
                 # (chunks are large so refresh overhead is acceptable)
