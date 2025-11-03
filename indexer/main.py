@@ -84,6 +84,30 @@ def detect_script_type(spk):
         
         return script_type_map.get(spk.get("type"), "nonstandard")
 
+def address_from_vout(v):
+    """Extract address from vout's scriptPubKey.addresses array (Bitcoin Core RPC format)."""
+    if not v:
+        return None
+    spk = v.get("scriptPubKey", {})
+    if not spk:
+        return None
+    addresses = spk.get("addresses", [])
+    if addresses and len(addresses) > 0:
+        return addresses[0]
+    # Fallback: try address field directly (some RPC versions use this)
+    address = spk.get("address")
+    if address:
+        return address
+    
+    script_hex = v.get("scriptPubKey", {}).get("hex")
+    if script_hex:
+        script_bytes = bytes.fromhex(script_hex)
+        address = network.address.for_script(script_bytes)
+        if address:
+            return str(address)
+
+    return None
+
 # ========================
 # DB
 # ========================
@@ -112,6 +136,17 @@ def schema_init():
         db.shutdown_pool()
 
 # ========================
+# Global state for graceful shutdown
+# ========================
+shutdown_requested = False
+
+def signal_handler(signum, frame):
+    """Handle SIGINT/SIGTERM for graceful shutdown."""
+    global shutdown_requested
+    print(f"\nReceived signal {signum}, shutting down gracefully...")
+    shutdown_requested = True
+
+# ========================
 # Range processing
 # ========================
 def get_last_processed_height():
@@ -123,6 +158,110 @@ def get_last_processed_height():
     except Exception as e:
         print(f"Error getting last processed height: {e}")
         return 0
+
+def process_single_block(height):
+    """Process a single block and save to database immediately."""
+    if shutdown_requested:
+        return False
+    
+    try:
+        blockhash = rpc_call("getblockhash", [height])
+        block = rpc_call("getblock", [blockhash, 3])
+    except Exception as e:
+        # Handle case where block is not yet available during sync
+        error_msg = str(e)
+        if "not found" in error_msg.lower() or "invalid" in error_msg.lower():
+            print(f"Block {height} not yet available (bitcoind may still be syncing)")
+            return False
+        print(f"Error reading block {height}: {e}")
+        return False
+    
+    block_time = block.get('time', 0)
+    block_ts = int(block_time * 1_000_000_000)
+    
+    vout_rows = []
+    vin_rows = []
+    
+    for tx in block.get("tx", []):
+        txid = tx.get("txid", "")
+        for idx, v in enumerate(tx.get("vout", [])):
+            spk = v.get("scriptPubKey", {})
+            address = address_from_vout(v)
+            value_btc = float(v.get("value", 0))
+            value_sat = int(value_btc * 100_000_000)
+            vout_rows.append((
+                txid,
+                idx,
+                address or None,
+                value_sat,
+                spk.get("hex", ""),
+                detect_script_type(spk),
+                height,
+                block_ts
+            ))
+        for vin_idx, vin in enumerate(tx.get("vin", [])):
+            if "txid" not in vin:
+                continue
+            prev_txid = vin.get("txid")
+            prev_vout = int(vin.get("vout", 0))
+            vin_rows.append((
+                True,
+                txid,
+                vin_idx,
+                height,
+                block_ts,
+                prev_txid,
+                prev_vout
+            ))
+    
+    try:
+        db.init_pool()
+        with db.get_db_cursor() as cur:
+            if vout_rows:
+                execute_batch(cur,
+                    """
+                    INSERT INTO utxos (txid, vout, address, value_sat, script_pub_key_hex, script_pub_type, created_block, created_block_timestamp)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (txid, vout) DO UPDATE SET
+                        address = EXCLUDED.address,
+                        value_sat = EXCLUDED.value_sat,
+                        script_pub_key_hex = EXCLUDED.script_pub_key_hex,
+                        script_pub_type = EXCLUDED.script_pub_type,
+                        created_block = EXCLUDED.created_block,
+                        created_block_timestamp = EXCLUDED.created_block_timestamp
+                    """,
+                    vout_rows, page_size=500
+                )
+            
+            if vin_rows:
+                execute_batch(cur,
+                    """
+                    UPDATE utxos u
+                    SET spent = %s,
+                        spent_by_txid = %s,
+                        spent_vin = %s,
+                        spent_block = %s,
+                        spent_block_timestamp = %s
+                    WHERE u.txid = %s AND u.vout = %s AND (u.spent IS DISTINCT FROM TRUE)
+                    """,
+                    vin_rows, page_size=500
+                )
+            
+            # Insert block log entry
+            cur.execute(
+                """
+                INSERT INTO block_log (block_height, block_hash, block_timestamp)
+                VALUES (%s, %s, %s)
+                """,
+                (height, blockhash, block_ts)
+            )
+        db.shutdown_pool()
+        print(f"Processed block {height} ({blockhash[:16]}...)")
+        return True
+    except Exception as e:
+        print(f"Error writing block {height} to PostgreSQL: {e}")
+        db.shutdown_pool()
+        return False
 
 def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
     if start_height > end_height:
@@ -190,6 +329,10 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
             })
 
     for chunk_start in range(start_height, end_height + 1, chunk_size):
+        if shutdown_requested:
+            print("Shutdown requested during catch-up")
+            break
+        
         db.init_pool()
         chunk_end = min(chunk_start + chunk_size - 1, end_height)
         print(f"Processing chunk {chunk_start} → {chunk_end}")
@@ -198,7 +341,7 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
         to_process = list(range(chunk_start, chunk_end + 1))
         failed_blocks = []
         retries = 0
-        while to_process and retries < MAX_RETRIES:
+        while to_process and retries < MAX_RETRIES and not shutdown_requested:
             failed_blocks.clear()
             with concurrent.futures.ThreadPoolExecutor(max_workers=THREADS) as executor:
                 futures = [executor.submit(process_block, h, out_lists, failed_blocks) for h in to_process]
@@ -260,12 +403,71 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
         print(f"Saved and flushed chunk {chunk_start}–{chunk_end}")
 
 def main():
-    schema_init()
+    global shutdown_requested
+    
+    # Set up signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # schema_init()
     last = get_last_processed_height()
-    tip = rpc_call("getblockcount")
-    start = max(0, last + 1)
-    if start <= tip:
-        process_range(start, tip)
+    
+    # Initial catch-up: process from last_processed to current tip
+    print(f"Starting indexer. Last processed: {last}")
+    
+    try:
+        tip = rpc_call("getblockcount")
+        start = max(0, last + 1)
+        
+        if start <= tip:
+            print(f"Catching up: processing blocks {start} → {tip}")
+            process_range(start, tip)
+        
+        # Continuous polling loop
+        print("Catch-up complete. Entering continuous sync mode...")
+        
+        while not shutdown_requested:
+            try:
+                current_tip = rpc_call("getblockcount")
+                last_processed = get_last_processed_height()
+                
+                if last_processed < current_tip:
+                    # Process new blocks one at a time
+                    for height in range(last_processed + 1, current_tip + 1):
+                        if shutdown_requested:
+                            break
+                        # Retry logic for individual blocks
+                        retries = 0
+                        while retries < MAX_RETRIES:
+                            success = process_single_block(height)
+                            if success:
+                                break
+                            retries += 1
+                            if retries < MAX_RETRIES:
+                                print(f"Retrying block {height} (attempt {retries + 1}/{MAX_RETRIES})...")
+                                time.sleep(1)
+                            else:
+                                print(f"Failed to process block {height} after {MAX_RETRIES} retries")
+                
+                # Wait before next poll
+                time.sleep(POLL_INTERVAL)
+                
+            except requests.exceptions.RequestException as e:
+                print(f"RPC connection error: {e}. Retrying in {RECONNECT_DELAY} seconds...")
+                time.sleep(RECONNECT_DELAY)
+            except Exception as e:
+                print(f"Unexpected error in polling loop: {e}")
+                time.sleep(RECONNECT_DELAY)
+        
+        print("Shutdown complete. Cleaning up...")
+        db.shutdown_pool()
+        
+    except KeyboardInterrupt:
+        print("\nInterrupted by user")
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        db.shutdown_pool()
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
