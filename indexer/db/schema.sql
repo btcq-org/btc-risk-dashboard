@@ -66,18 +66,47 @@ CREATE TABLE IF NOT EXISTS utxos (
     PRIMARY KEY (txid, vout)
 );
 
+-- Index on address for lookups (TEXT index for equality checks)
 CREATE INDEX IF NOT EXISTS utxos_address_idx ON utxos (address);
+-- Index on spent flag for filtering unspent UTXOs
 CREATE INDEX IF NOT EXISTS utxos_spent_idx ON utxos (spent);
+-- Index for ordering by creation block (descending for newest first)
 CREATE INDEX IF NOT EXISTS utxos_created_block_idx ON utxos (created_block DESC);
+-- Partial index for spent UTXOs by block (smaller, faster)
 CREATE INDEX IF NOT EXISTS utxos_spent_block_idx ON utxos (spent_block DESC) WHERE spent;
+-- Note: PRIMARY KEY (txid, vout) already provides index for UPDATE/ON CONFLICT queries
 
 -- =======================
 -- Address Status (computed from UTXOs)
 -- =======================
 
--- View with latest status per address derived from utxos table
-CREATE OR REPLACE VIEW address_status AS
-WITH per_addr AS (
+-- Drop existing view if it exists (for migration)
+DROP VIEW IF EXISTS address_status CASCADE;
+
+-- Materialized view with latest status per address derived from utxos table
+-- Pre-computes aggregations to avoid expensive subqueries on every query
+-- Uses window functions to efficiently get latest script_pub_type without correlated subqueries
+CREATE MATERIALIZED VIEW address_status AS
+WITH script_type_ranked AS (
+    SELECT
+        address,
+        script_pub_type,
+        ROW_NUMBER() OVER (
+            PARTITION BY address 
+            ORDER BY 
+                CASE WHEN NOT spent THEN 0 ELSE 1 END,  -- Unspent first
+                created_block DESC, 
+                created_block_timestamp DESC
+        ) AS rn
+    FROM utxos
+    WHERE address IS NOT NULL AND address <> ''
+),
+latest_script_type AS (
+    SELECT address, script_pub_type
+    FROM script_type_ranked
+    WHERE rn = 1
+),
+per_addr AS (
     SELECT
         address,
         MIN(created_block) AS first_seen_block,
@@ -106,21 +135,19 @@ SELECT
     pa.balance_sat,
     pa.utxo_count,
     pa.appearances AS tx_count,
-    -- Latest known script pub type from the newest unspent creation; fallback to newest creation
-    COALESCE(
-        (
-            SELECT u.script_pub_type
-            FROM utxos u
-            WHERE u.address = pa.address AND (NOT u.spent)
-            ORDER BY u.created_block DESC, u.created_block_timestamp DESC
-            LIMIT 1
-        ),
-        (
-            SELECT u2.script_pub_type
-            FROM utxos u2
-            WHERE u2.address = pa.address
-            ORDER BY u2.created_block DESC, u2.created_block_timestamp DESC
-            LIMIT 1
-        )
-    ) AS script_pub_type
-FROM per_addr pa;
+    lst.script_pub_type
+FROM per_addr pa
+LEFT JOIN latest_script_type lst ON pa.address = lst.address;
+
+-- Indexes for fast lookups
+CREATE INDEX IF NOT EXISTS address_status_script_pub_type_idx ON address_status (script_pub_type);
+CREATE INDEX IF NOT EXISTS address_status_address_idx ON address_status (address);
+
+-- Function to refresh the materialized view
+CREATE OR REPLACE FUNCTION refresh_address_status() RETURNS void
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    REFRESH MATERIALIZED VIEW address_status;
+END;
+$$;

@@ -40,6 +40,8 @@ RECONNECT_DELAY = 5.0    # seconds to wait after connection error
 
 CHUNK_SIZE = 1000        # number of blocks to process per DB bulk write
 MAX_RETRIES = 5          # max retries for failed block fetches per chunk
+REFRESH_INTERVAL = 10    # refresh address_status every N blocks (0 = every block, -1 = never)
+VACUUM_INTERVAL = 100    # run VACUUM ANALYZE every N chunks (0 = every chunk, -1 = never)
 
 # ========================
 # RPC UTILS
@@ -159,8 +161,13 @@ def get_last_processed_height():
         print(f"Error getting last processed height: {e}")
         return 0
 
+# Track blocks since last refresh for rate limiting
+_blocks_since_refresh = 0
+_chunks_processed = 0  # Track chunks for VACUUM maintenance
+
 def process_single_block(height):
     """Process a single block and save to database immediately."""
+    global _blocks_since_refresh
     if shutdown_requested:
         return False
     
@@ -215,7 +222,8 @@ def process_single_block(height):
             ))
     
     try:
-        db.init_pool()
+        db_start = time.time()
+        print(f"[Block {height}] Starting database write...")
         with db.get_db_cursor() as cur:
             if vout_rows:
                 execute_batch(cur,
@@ -236,13 +244,13 @@ def process_single_block(height):
             if vin_rows:
                 execute_batch(cur,
                     """
-                    UPDATE utxos u
+                    UPDATE utxos
                     SET spent = %s,
                         spent_by_txid = %s,
                         spent_vin = %s,
                         spent_block = %s,
                         spent_block_timestamp = %s
-                    WHERE u.txid = %s AND u.vout = %s AND (u.spent IS DISTINCT FROM TRUE)
+                    WHERE txid = %s AND vout = %s AND (spent IS DISTINCT FROM TRUE)
                     """,
                     vin_rows, page_size=500
                 )
@@ -255,12 +263,25 @@ def process_single_block(height):
                 """,
                 (height, blockhash, block_ts)
             )
-        db.shutdown_pool()
+            
+            # Refresh address_status materialized view periodically
+            # REFRESH_INTERVAL > 0: refresh every N blocks
+            # REFRESH_INTERVAL = 0: refresh every block (expensive)
+            # REFRESH_INTERVAL < 0: never refresh automatically
+            _blocks_since_refresh += 1
+            if REFRESH_INTERVAL > 0:
+                if _blocks_since_refresh >= REFRESH_INTERVAL:
+                    cur.execute("SELECT refresh_address_status()")
+                    _blocks_since_refresh = 0
+            elif REFRESH_INTERVAL == 0:
+                cur.execute("SELECT refresh_address_status()")
+                _blocks_since_refresh = 0
+        db_time = time.time() - db_start
+        print(f"[Block {height}] Database write completed in {db_time:.3f}s")
         print(f"Processed block {height} ({blockhash[:16]}...)")
         return True
     except Exception as e:
         print(f"Error writing block {height} to PostgreSQL: {e}")
-        db.shutdown_pool()
         return False
 
 def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
@@ -333,7 +354,6 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
             print("Shutdown requested during catch-up")
             break
         
-        db.init_pool()
         chunk_end = min(chunk_start + chunk_size - 1, end_height)
         print(f"Processing chunk {chunk_start} → {chunk_end}")
 
@@ -341,6 +361,8 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
         to_process = list(range(chunk_start, chunk_end + 1))
         failed_blocks = []
         retries = 0
+        
+        fetch_start = time.time()
         while to_process and retries < MAX_RETRIES and not shutdown_requested:
             failed_blocks.clear()
             with concurrent.futures.ThreadPoolExecutor(max_workers=THREADS) as executor:
@@ -354,10 +376,15 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                 print(f"Retrying {len(failed_blocks)} failed blocks in chunk {chunk_start}–{chunk_end} (attempt {retries+2}/{MAX_RETRIES})...")
             to_process = failed_blocks[:]
             retries += 1
+        fetch_time = time.time() - fetch_start
         if to_process:
             print(f"Failed to process blocks after {MAX_RETRIES} retries in chunk {chunk_start}–{chunk_end}: {to_process}")
+        else:
+            print(f"[Chunk {chunk_start}-{chunk_end}] Fetched {chunk_end - chunk_start + 1} blocks in {fetch_time:.3f}s")
 
         try:
+            db_start = time.time()
+            print(f"[Chunk {chunk_start}-{chunk_end}] Starting database write...")
             with db.get_db_cursor() as cur:
                 if out_lists['vout_rows']:
                     execute_batch(cur,
@@ -378,13 +405,13 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                 if out_lists['vin_rows']:
                     execute_batch(cur,
                         """
-                        UPDATE utxos u
+                        UPDATE utxos
                         SET spent = %s,
                             spent_by_txid = %s,
                             spent_vin = %s,
                             spent_block = %s,
                             spent_block_timestamp = %s
-                        WHERE u.txid = %s AND u.vout = %s AND (u.spent IS DISTINCT FROM TRUE)
+                        WHERE txid = %s AND vout = %s AND (spent IS DISTINCT FROM TRUE)
                         """,
                         out_lists['vin_rows'], page_size=500
                     )
@@ -397,9 +424,33 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                         """,
                         block_vals
                     )
+                
+                # Refresh address_status materialized view after each chunk during catch-up
+                # (chunks are large so refresh overhead is acceptable)
+                if REFRESH_INTERVAL >= 0:
+                    cur.execute("SELECT refresh_address_status()")
+            db_time = time.time() - db_start
+            print(f"[Chunk {chunk_start}-{chunk_end}] Database write completed in {db_time:.3f}s")
+            
+            # Periodic VACUUM ANALYZE for table maintenance (prevents bloat and keeps stats fresh)
+            global _chunks_processed
+            _chunks_processed += 1
+            if VACUUM_INTERVAL > 0 and _chunks_processed >= VACUUM_INTERVAL:
+                print(f"Running VACUUM ANALYZE (after {_chunks_processed} chunks)...")
+                vacuum_start = time.time()
+                with db.get_db_cursor() as vac_cur:
+                    vac_cur.execute("VACUUM ANALYZE utxos")
+                    vac_cur.execute("VACUUM ANALYZE block_log")
+                vacuum_time = time.time() - vacuum_start
+                print(f"VACUUM ANALYZE completed in {vacuum_time:.3f}s")
+                _chunks_processed = 0
+            elif VACUUM_INTERVAL == 0:
+                # Every chunk (only for testing - expensive!)
+                print("Running VACUUM ANALYZE after chunk...")
+                with db.get_db_cursor() as vac_cur:
+                    vac_cur.execute("VACUUM ANALYZE utxos")
         except Exception as e:
             print(f"Error writing chunk {chunk_start}-{chunk_end} to PostgreSQL: {e}")
-        db.shutdown_pool()
         print(f"Saved and flushed chunk {chunk_start}–{chunk_end}")
 
 def main():
@@ -408,6 +459,9 @@ def main():
     # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Initialize database pool once at startup
+    db.init_pool()
     
     # schema_init()
     last = get_last_processed_height()
