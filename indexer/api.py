@@ -106,6 +106,24 @@ def search(q: str = Query(..., min_length=1)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/latest/addresses")
+def latest_addresses(limit: int = Query(20, ge=1, le=100)):
+    """Return the most recently added addresses from address_status.
+    Ordered by first_seen_block (most recently first seen addresses first).
+    """
+    try:
+        with db.get_db_cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT *
+                FROM address_status
+                ORDER BY first_seen_block DESC, first_seen_block_timestamp DESC
+                LIMIT %s
+            """, (limit,))
+            rows = cur.fetchall()
+        return {"results": rows}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/latest/utxos")
 def latest_utxos(limit: int = Query(20, ge=1, le=100)):
     """Return the most recent UTXOs created.
