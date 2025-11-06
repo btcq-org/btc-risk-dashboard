@@ -19,64 +19,61 @@ app.add_middleware(
 def stats_overview():
     try:
         with db.get_db_cursor(cursor_factory=RealDictCursor) as cur:
-            # Get counts from all tables
-            cur.execute("SELECT COUNT(*)::bigint AS address_count FROM address_status")
-            addr_row = cur.fetchone()
-            address_count = int(addr_row["address_count"]) if addr_row else 0
+            # Get pre-aggregated address stats from materialized view
+            cur.execute("SELECT * FROM address_stats LIMIT 1")
+            address_stats_row = cur.fetchone()
+            if address_stats_row:
+                address_count = int(address_stats_row["address_count"])
+                high_risk_address_count = int(address_stats_row["high_risk_address_count"])
+                medium_risk_address_count = int(address_stats_row["medium_risk_address_count"])
+            else:
+                address_count = 0
+                high_risk_address_count = 0
+                medium_risk_address_count = 0
 
-            cur.execute("SELECT COUNT(*)::bigint AS utxo_count FROM utxos")
-            utxo_row = cur.fetchone()
-            utxo_count = int(utxo_row["utxo_count"]) if utxo_row else 0
+            # Get pre-aggregated UTXO stats from materialized view
+            cur.execute("SELECT * FROM utxo_stats LIMIT 1")
+            utxo_stats_row = cur.fetchone()
+            if utxo_stats_row:
+                utxo_count = int(utxo_stats_row["total_utxos"])
+                spent_utxos = int(utxo_stats_row["spent_utxos"])
+                unspent_utxos = int(utxo_stats_row["unspent_utxos"])
+                spent_value_sat = int(utxo_stats_row["spent_value_sat"])
+                unspent_value_sat = int(utxo_stats_row["unspent_value_sat"])
+                total_value_sat = int(utxo_stats_row["total_value_sat"])
+            else:
+                utxo_count = 0
+                spent_utxos = 0
+                unspent_utxos = 0
+                spent_value_sat = 0
+                unspent_value_sat = 0
+                total_value_sat = 0
 
-            cur.execute("SELECT COUNT(*)::bigint AS scanned_blocks FROM block_log")
-            sb_row = cur.fetchone()
-            scanned_blocks = int(sb_row["scanned_blocks"]) if sb_row else 0
-
-            # Risk classification based on script types
-            high_risk_types = ("P2PK", "P2MS", "P2PR")
-            medium_risk_types = ("P2PKH", "P2SH", "P2WPKH", "P2WSH")
-
-            cur.execute(
-                """
-                SELECT COUNT(*)::bigint AS cnt
-                FROM address_status
-                WHERE script_pub_type = ANY(%s)
-                """,
-                (list(high_risk_types),),
-            )
-            hr_row = cur.fetchone()
-            high_risk_address_count = int(hr_row["cnt"]) if hr_row else 0
-
-            cur.execute(
-                """
-                SELECT COUNT(*)::bigint AS cnt
-                FROM address_status
-                WHERE script_pub_type = ANY(%s)
-                """,
-                (list(medium_risk_types),),
-            )
-            mr_row = cur.fetchone()
-            medium_risk_address_count = int(mr_row["cnt"]) if mr_row else 0
-
-            # latest scanned block (height, hash, scanned_at)
-            cur.execute("""
-                SELECT block_height, block_hash, scanned_at
-                FROM block_log
-                ORDER BY block_height DESC LIMIT 1
-            """)
-            latest_row = cur.fetchone()
-            if latest_row:
+            # Get pre-aggregated block stats from materialized view
+            cur.execute("SELECT * FROM block_stats LIMIT 1")
+            block_stats_row = cur.fetchone()
+            if block_stats_row and block_stats_row["latest_block_height"] is not None:
+                scanned_blocks = int(block_stats_row["scanned_blocks"])
                 latest_block = {
-                    "height": int(latest_row["block_height"]),
-                    "hash": latest_row["block_hash"],
-                    "scanned_at": str(latest_row["scanned_at"]),
+                    "height": int(block_stats_row["latest_block_height"]),
+                    "hash": block_stats_row["latest_block_hash"],
+                    "scanned_at": str(block_stats_row["latest_block_scanned_at"]),
                 }
             else:
+                scanned_blocks = 0
                 latest_block = None
 
             return {
                 "address_count": address_count,
                 "utxo_count": utxo_count,
+                "utxo_stats": {
+                    "total_utxos": spent_utxos + unspent_utxos,
+                    "spent_utxos": spent_utxos,
+                    "unspent_utxos": unspent_utxos,
+                    "spent_value_sat": spent_value_sat,
+                    "unspent_value_sat": unspent_value_sat,
+                    "total_value_sat": total_value_sat,
+                },
                 "scanned_blocks": scanned_blocks,
                 "high_risk_address_count": high_risk_address_count,
                 "medium_risk_address_count": medium_risk_address_count,
@@ -103,24 +100,6 @@ def search(q: str = Query(..., min_length=1)):
                 results.append(row)
 
         return {"results": results}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/latest/addresses")
-def latest_addresses(limit: int = Query(20, ge=1, le=100)):
-    """Return the most recently added addresses from address_status.
-    Ordered by first_seen_block (most recently first seen addresses first).
-    """
-    try:
-        with db.get_db_cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT *
-                FROM address_status
-                ORDER BY first_seen_block DESC, first_seen_block_timestamp DESC
-                LIMIT %s
-            """, (limit,))
-            rows = cur.fetchall()
-        return {"results": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -151,6 +130,24 @@ def latest_blocks(limit: int = Query(20, ge=1, le=100)):
                 SELECT *
                 FROM block_log
                 ORDER BY block_height DESC
+                LIMIT %s
+            """, (limit,))
+            rows = cur.fetchall()
+        return {"results": rows}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/latest/addresses")
+def latest_addresses(limit: int = Query(20, ge=1, le=100)):
+    """Return the most recently added addresses from address_status.
+    Ordered by first_seen_block (most recently first seen addresses first).
+    """
+    try:
+        with db.get_db_cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT *
+                FROM address_status
+                ORDER BY first_seen_block DESC, first_seen_block_timestamp DESC
                 LIMIT %s
             """, (limit,))
             rows = cur.fetchall()

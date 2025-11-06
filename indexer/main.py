@@ -9,8 +9,7 @@ from bitcoin.core.script import CScript
 from bitcoin.core.key import CPubKey
 from bitcoin import SelectParams
 
-import requests, json, concurrent.futures
-from threading import Lock
+import requests, json
 import time
 import signal
 import sys
@@ -61,6 +60,52 @@ def rpc_call(method, params=None):
     if r.get("error"):
         raise Exception(r["error"])
     return r["result"]
+
+def rpc_batch_call(rpc_requests):
+    """
+    Send multiple RPC requests in a single batch call using Bitcoin Core's native batching.
+    Bitcoin Core supports JSON-RPC batch requests by sending an array of request objects.
+    rpc_requests: list of tuples (method, params, height)
+    Returns: dict mapping height to result (or {"error": ...} for errors)
+    """
+    if not rpc_requests:
+        return {}
+    
+    payload = []
+    id_to_height = {}
+    for idx, (method, params, height) in enumerate(rpc_requests):
+        request_id = f"batch-{height}-{idx}"
+        id_to_height[request_id] = height
+        # Bitcoin Core accepts batch requests with jsonrpc 1.0 or 2.0
+        payload.append({
+            "jsonrpc": "1.0",
+            "id": request_id,
+            "method": method,
+            "params": params or []
+        })
+    
+    resp = requests.post(RPC_URL, auth=(RPC_USER, RPC_PASSWORD),
+                         headers={"content-type": "text/plain"},
+                         data=json.dumps(payload))
+    resp.raise_for_status()
+    results = resp.json()
+    
+    # Handle both single response (if only one request) and array response
+    if not isinstance(results, list):
+        results = [results]
+    
+    # Map results back to heights, handling errors
+    result_map = {}
+    for r in results:
+        request_id = r.get("id", "")
+        if r.get("error"):
+            height = id_to_height.get(request_id, "unknown")
+            result_map[height] = {"error": r["error"]}
+        else:
+            height = id_to_height.get(request_id, "unknown")
+            result_map[height] = r.get("result")
+    
+    return result_map
 
 # ========================
 # Utils
@@ -247,6 +292,7 @@ def process_single_block(height):
                 vout_count = len(vout_rows)
                 print(f"[Block {height}] Inserting {vout_count} UTXOs...")
                 # Use execute_values for faster bulk inserts (uses COPY internally)
+                # Increased page_size for better performance with large datasets
                 execute_values(cur,
                     """
                     INSERT INTO utxos (txid, vout, address, value_sat, script_pub_key_hex, script_pub_type, created_block, created_block_timestamp)
@@ -259,7 +305,7 @@ def process_single_block(height):
                         created_block = EXCLUDED.created_block,
                         created_block_timestamp = EXCLUDED.created_block_timestamp
                     """,
-                    vout_rows, page_size=1000, template=None
+                    vout_rows, page_size=10000, template=None
                 )
                 vout_time = time.time() - vout_start
                 print(f"[Block {height}] Inserted {vout_count} UTXOs in {vout_time:.3f}s")
@@ -269,6 +315,7 @@ def process_single_block(height):
                 vin_count = len(vin_rows)
                 print(f"[Block {height}] Updating {vin_count} spent UTXOs...")
                 # Use execute_batch for UPDATEs (execute_values doesn't support UPDATE well)
+                # Increased page_size for better performance with large datasets
                 execute_batch(cur,
                     """
                     UPDATE utxos
@@ -279,7 +326,7 @@ def process_single_block(height):
                         spent_block_timestamp = %s
                     WHERE txid = %s AND vout = %s AND (spent IS DISTINCT FROM TRUE)
                     """,
-                    vin_rows, page_size=1000
+                    vin_rows, page_size=10000
                 )
                 vin_time = time.time() - vin_start
                 print(f"[Block {height}] Updated {vin_count} spent UTXOs in {vin_time:.3f}s")
@@ -296,17 +343,17 @@ def process_single_block(height):
             block_log_time = time.time() - block_log_start
             print(f"[Block {height}] Inserted block_log in {block_log_time:.3f}s")
             
-            # Refresh address_status materialized view periodically
+            # Refresh materialized views periodically
             # REFRESH_INTERVAL > 0: refresh every N blocks
             # REFRESH_INTERVAL = 0: refresh every block (expensive)
             # REFRESH_INTERVAL < 0: never refresh automatically
             _blocks_since_refresh += 1
             if REFRESH_INTERVAL > 0:
                 if _blocks_since_refresh >= REFRESH_INTERVAL:
-                    cur.execute("SELECT refresh_address_status()")
+                    cur.execute("SELECT refresh_all_materialized_views()")
                     _blocks_since_refresh = 0
             elif REFRESH_INTERVAL == 0:
-                cur.execute("SELECT refresh_address_status()")
+                cur.execute("SELECT refresh_all_materialized_views()")
                 _blocks_since_refresh = 0
         db_time = time.time() - db_start
         print(f"[Block {height}] Database write completed in {db_time:.3f}s")
@@ -322,23 +369,13 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
 
     print(f"Processing blocks {start_height} → {end_height} in chunks of {chunk_size}")
 
-    lock = Lock()
-
-    def process_block(height, out_lists, failed_blocks):
-        blockhash = ""
-        try:
-            blockhash = rpc_call("getblockhash", [height])
-            block = rpc_call("getblock", [blockhash, 3])
-        except Exception as e:
-            print(f"Error reading block {height}: {e}")
-            failed_blocks.append(height)
-            return
-
+    def process_block_data(block, height, blockhash):
+        """Process a single block's data and return rows."""
         block_time = block.get('time', 0)
         block_ts = int(block_time * 1_000_000_000)
 
-        local_vout_rows = []
-        local_vin_rows = []
+        vout_rows = []
+        vin_rows = []
 
         for tx in block.get("tx", []):
             txid = tx.get("txid", "")
@@ -347,7 +384,7 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                 address = address_from_vout(v)
                 value_btc = float(v.get("value", 0))
                 value_sat = int(value_btc * 100_000_000)
-                local_vout_rows.append((
+                vout_rows.append((
                     txid,
                     idx,
                     address or None,
@@ -362,7 +399,7 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                     continue
                 prev_txid = vin.get("txid")
                 prev_vout = int(vin.get("vout", 0))
-                local_vin_rows.append((
+                vin_rows.append((
                     True,
                     txid,
                     vin_idx,
@@ -372,14 +409,15 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                     prev_vout
                 ))
 
-        with lock:
-            out_lists['vout_rows'].extend(local_vout_rows)
-            out_lists['vin_rows'].extend(local_vin_rows)
-            out_lists['scanned'].append({
+        return {
+            'vout_rows': vout_rows,
+            'vin_rows': vin_rows,
+            'block_info': {
                 "block_height": height,
                 "block_hash": blockhash,
                 "block_timestamp": block_ts
-            })
+            }
+        }
 
     for chunk_start in range(start_height, end_height + 1, chunk_size):
         if shutdown_requested:
@@ -397,17 +435,81 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
         fetch_start = time.time()
         while to_process and retries < MAX_RETRIES and not shutdown_requested:
             failed_blocks.clear()
-            with concurrent.futures.ThreadPoolExecutor(max_workers=THREADS) as executor:
-                futures = [executor.submit(process_block, h, out_lists, failed_blocks) for h in to_process]
-                for f in concurrent.futures.as_completed(futures):
+            
+            # Batch fetch all block hashes
+            hash_batch_requests = [("getblockhash", [height], height) for height in to_process]
+            try:
+                hash_results = rpc_batch_call(hash_batch_requests)
+            except Exception as e:
+                print(f"Error in batch getblockhash call: {e}")
+                failed_blocks = to_process[:]
+                to_process = failed_blocks[:]
+                retries += 1
+                continue
+            
+            # Build block fetch requests for successful hashes
+            block_batch_requests = []
+            height_to_hash = {}
+            for height in to_process:
+                if height in hash_results:
+                    result = hash_results[height]
+                    if isinstance(result, dict) and "error" in result:
+                        failed_blocks.append(height)
+                        continue
+                    blockhash = result
+                    if blockhash:
+                        height_to_hash[height] = blockhash
+                        block_batch_requests.append(("getblock", [blockhash, 3], height))
+                else:
+                    failed_blocks.append(height)
+            
+            # Batch fetch all blocks
+            if block_batch_requests:
+                try:
+                    block_results = rpc_batch_call(block_batch_requests)
+                except Exception as e:
+                    print(f"Error in batch getblock call: {e}")
+                    failed_blocks.extend([h for h in to_process if h not in failed_blocks])
+                    to_process = failed_blocks[:]
+                    retries += 1
+                    continue
+                
+                # Process all fetched blocks
+                for height in to_process:
+                    if height in failed_blocks:
+                        continue
+                    if height not in block_results:
+                        failed_blocks.append(height)
+                        continue
+                    
+                    result = block_results[height]
+                    if isinstance(result, dict) and "error" in result:
+                        failed_blocks.append(height)
+                        continue
+                    
+                    blockhash = height_to_hash.get(height, "")
+                    block = result
+                    if not block:
+                        failed_blocks.append(height)
+                        continue
+                    
                     try:
-                        f.result()
+                        block_data = process_block_data(block, height, blockhash)
+                        out_lists['vout_rows'].extend(block_data['vout_rows'])
+                        out_lists['vin_rows'].extend(block_data['vin_rows'])
+                        out_lists['scanned'].append(block_data['block_info'])
                     except Exception as e:
-                        print(f"Worker error: {e}")
+                        print(f"Error processing block {height}: {e}")
+                        failed_blocks.append(height)
+            else:
+                # All blocks failed at hash stage
+                pass
+            
             if failed_blocks:
                 print(f"Retrying {len(failed_blocks)} failed blocks in chunk {chunk_start}–{chunk_end} (attempt {retries+2}/{MAX_RETRIES})...")
             to_process = failed_blocks[:]
             retries += 1
+        
         fetch_time = time.time() - fetch_start
         if to_process:
             print(f"Failed to process blocks after {MAX_RETRIES} retries in chunk {chunk_start}–{chunk_end}: {to_process}")
@@ -423,6 +525,7 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                     vout_count = len(out_lists['vout_rows'])
                     print(f"[Chunk {chunk_start}-{chunk_end}] Inserting {vout_count} UTXOs...")
                     # Use execute_values for faster bulk inserts (uses COPY internally)
+                    # Increased page_size for better performance with large datasets (1M+ records)
                     execute_values(cur,
                         """
                         INSERT INTO utxos (txid, vout, address, value_sat, script_pub_key_hex, script_pub_type, created_block, created_block_timestamp)
@@ -435,7 +538,7 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                             created_block = EXCLUDED.created_block,
                             created_block_timestamp = EXCLUDED.created_block_timestamp
                         """,
-                        out_lists['vout_rows'], page_size=1000, template=None
+                        out_lists['vout_rows'], page_size=10000, template=None
                     )
                     vout_time = time.time() - vout_start
                     print(f"[Chunk {chunk_start}-{chunk_end}] Inserted {vout_count} UTXOs in {vout_time:.3f}s")
@@ -445,6 +548,7 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                     vin_count = len(out_lists['vin_rows'])
                     print(f"[Chunk {chunk_start}-{chunk_end}] Updating {vin_count} spent UTXOs...")
                     # Use execute_batch for UPDATEs (execute_values doesn't support UPDATE well)
+                    # Increased page_size for better performance with large datasets (1M+ records)
                     execute_batch(cur,
                         """
                         UPDATE utxos
@@ -455,7 +559,7 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                             spent_block_timestamp = %s
                         WHERE txid = %s AND vout = %s AND (spent IS DISTINCT FROM TRUE)
                         """,
-                        out_lists['vin_rows'], page_size=1000
+                        out_lists['vin_rows'], page_size=10000
                     )
                     vin_time = time.time() - vin_start
                     print(f"[Chunk {chunk_start}-{chunk_end}] Updated {vin_count} spent UTXOs in {vin_time:.3f}s")
@@ -465,19 +569,21 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                     block_count = len(out_lists['scanned'])
                     block_vals = [(b['block_height'], b['block_hash'], b['block_timestamp']) for b in out_lists['scanned']]
                     print(f"[Chunk {chunk_start}-{chunk_end}] Inserting {block_count} block_log entries...")
-                    db.execute_values(cur,
+                    # Use execute_values for batch insert (already imported from psycopg2.extras)
+                    # Increased page_size for better performance with large datasets
+                    execute_values(cur,
                         """
                         INSERT INTO block_log (block_height, block_hash, block_timestamp) VALUES %s
                         """,
-                        block_vals
+                        block_vals, page_size=10000, template=None
                     )
                     block_log_time = time.time() - block_log_start
                     print(f"[Chunk {chunk_start}-{chunk_end}] Inserted {block_count} block_log entries in {block_log_time:.3f}s")
                 
-                # Refresh address_status materialized view after each chunk during catch-up
+                # Refresh materialized views after each chunk during catch-up
                 # (chunks are large so refresh overhead is acceptable)
                 if REFRESH_INTERVAL >= 0:
-                    cur.execute("SELECT refresh_address_status()")
+                    cur.execute("SELECT refresh_all_materialized_views()")
             db_time = time.time() - db_start
             print(f"[Chunk {chunk_start}-{chunk_end}] Database write completed in {db_time:.3f}s")
             
