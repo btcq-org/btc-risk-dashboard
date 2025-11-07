@@ -151,3 +151,99 @@ BEGIN
     REFRESH MATERIALIZED VIEW address_status;
 END;
 $$;
+
+-- =======================
+-- UTXO Stats Aggregation (computed from UTXOs)
+-- =======================
+
+-- Drop existing view if it exists (for migration)
+DROP MATERIALIZED VIEW IF EXISTS utxo_stats CASCADE;
+
+-- Materialized view with aggregated UTXO statistics
+-- Pre-computes spent/unspent aggregations to avoid expensive queries on every API call
+CREATE MATERIALIZED VIEW utxo_stats AS
+SELECT
+    COUNT(*)::bigint AS total_utxos,
+    COUNT(*) FILTER (WHERE spent)::bigint AS spent_utxos,
+    COUNT(*) FILTER (WHERE NOT spent)::bigint AS unspent_utxos,
+    COALESCE(SUM(value_sat) FILTER (WHERE spent), 0)::bigint AS spent_value_sat,
+    COALESCE(SUM(value_sat) FILTER (WHERE NOT spent), 0)::bigint AS unspent_value_sat,
+    COALESCE(SUM(value_sat), 0)::bigint AS total_value_sat
+FROM utxos;
+
+-- Function to refresh the UTXO stats materialized view
+CREATE OR REPLACE FUNCTION refresh_utxo_stats() RETURNS void
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    REFRESH MATERIALIZED VIEW utxo_stats;
+END;
+$$;
+
+-- =======================
+-- Address Stats Aggregation (computed from address_status)
+-- =======================
+
+-- Drop existing view if it exists (for migration)
+DROP MATERIALIZED VIEW IF EXISTS address_stats CASCADE;
+
+-- Materialized view with aggregated address statistics
+-- Pre-computes address counts and risk classifications to avoid expensive queries on every API call
+CREATE MATERIALIZED VIEW address_stats AS
+SELECT
+    COUNT(*)::bigint AS address_count,
+    COUNT(*) FILTER (WHERE script_pub_type = ANY(ARRAY['P2PK', 'P2MS', 'P2PR']))::bigint AS high_risk_address_count,
+    COUNT(*) FILTER (WHERE script_pub_type = ANY(ARRAY['P2PKH', 'P2SH', 'P2WPKH', 'P2WSH']))::bigint AS medium_risk_address_count
+FROM address_status;
+
+-- Function to refresh the address stats materialized view
+CREATE OR REPLACE FUNCTION refresh_address_stats() RETURNS void
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    REFRESH MATERIALIZED VIEW address_stats;
+END;
+$$;
+
+-- =======================
+-- Block Stats Aggregation (computed from block_log)
+-- =======================
+
+-- Drop existing view if it exists (for migration)
+DROP MATERIALIZED VIEW IF EXISTS block_stats CASCADE;
+
+-- Materialized view with aggregated block statistics
+-- Pre-computes block count and latest block info to avoid expensive queries on every API call
+CREATE MATERIALIZED VIEW block_stats AS
+WITH latest_block_info AS (
+    SELECT block_height, block_hash, scanned_at
+    FROM block_log
+    ORDER BY block_height DESC, scanned_at DESC
+    LIMIT 1
+)
+SELECT
+    (SELECT COUNT(*)::bigint FROM block_log) AS scanned_blocks,
+    (SELECT block_height FROM latest_block_info) AS latest_block_height,
+    (SELECT block_hash FROM latest_block_info) AS latest_block_hash,
+    (SELECT scanned_at FROM latest_block_info) AS latest_block_scanned_at;
+
+-- Function to refresh the block stats materialized view
+CREATE OR REPLACE FUNCTION refresh_block_stats() RETURNS void
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    REFRESH MATERIALIZED VIEW block_stats;
+END;
+$$;
+
+-- Function to refresh all materialized views
+CREATE OR REPLACE FUNCTION refresh_all_materialized_views() RETURNS void
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    REFRESH MATERIALIZED VIEW address_status;
+    REFRESH MATERIALIZED VIEW utxo_stats;
+    REFRESH MATERIALIZED VIEW address_stats;
+    REFRESH MATERIALIZED VIEW block_stats;
+END;
+$$;
