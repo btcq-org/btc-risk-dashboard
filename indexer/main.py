@@ -25,26 +25,63 @@ from pycoin.symbols.btc import network
 # CONFIGURATION
 # ========================
 NETWORK = 'testnet'
-RPC_USER = "admin"
-RPC_PASSWORD = "pass"
-RPC_PORT = 18332
-RPC_URL = f"http://127.0.0.1:{RPC_PORT}/"
+RPC_USER = os.getenv('RPC_USER', 'admin')
+RPC_PASSWORD = os.getenv('RPC_PASSWORD', 'pass')
+RPC_HOST = os.getenv('RPC_HOST', '127.0.0.1')
+RPC_PORT = int(os.getenv('RPC_PORT', '18332'))
+RPC_URL = f"http://{RPC_HOST}:{RPC_PORT}/"
 
 SelectParams(NETWORK)
 
-THREADS = 8              # number of parallel workers
-INITIAL_BLOCKS = 100     # number of historical blocks to scan on startup
-POLL_INTERVAL = 1.0      # seconds between checking for new blocks
-RECONNECT_DELAY = 5.0    # seconds to wait after connection error
+THREADS = 8                               # number of parallel workers
+INITIAL_BLOCKS = 100                      # number of historical blocks to scan on startup
+POLL_INTERVAL = 1.0                       # seconds between checking for new blocks
+RECONNECT_DELAY = 5.0                     # seconds to wait after connection error
 
-CHUNK_SIZE = 1000        # number of blocks to process per DB bulk write
-MAX_RETRIES = 5          # max retries for failed block fetches per chunk
-REFRESH_INTERVAL = 10    # refresh address_status every N blocks (0 = every block, -1 = never)
-VACUUM_INTERVAL = 100    # run VACUUM ANALYZE every N chunks (0 = every chunk, -1 = never)
+# Tuning knobs (can be overridden by env)
+CHUNK_SIZE = int(os.getenv('CHUNK_SIZE', '200'))                    # blocks per catch-up chunk
+MAX_RETRIES = int(os.getenv('MAX_RETRIES', '5'))                    # max retries for failed RPC
+REFRESH_INTERVAL = int(os.getenv('REFRESH_INTERVAL', '10'))         # MV refresh cadence
+VACUUM_INTERVAL = int(os.getenv('VACUUM_INTERVAL', '100'))          # VACUUM cadence in chunks
+MAX_RPC_BATCH = int(os.getenv('MAX_RPC_BATCH', '100'))              # cap per JSON-RPC batch
+DB_PAGE_ROWS = int(os.getenv('DB_PAGE_ROWS', '2000'))               # rows per DB insert/update page
 
 # ========================
 # RPC UTILS
 # ========================
+def test_rpc_connection():
+    """Test RPC connection and provide helpful error messages."""
+    try:
+        result = rpc_call("getblockcount")
+        print(f"✓ RPC connection successful. Current block height: {result}")
+        return True
+    except requests.exceptions.ConnectionError as e:
+        print(f"✗ Failed to connect to Bitcoin RPC at {RPC_URL}")
+        print(f"  Error: {e}")
+        print(f"\n  Troubleshooting steps:")
+        print(f"  1. Ensure Bitcoin Core is running")
+        print(f"  2. Check that RPC is enabled in bitcoin.conf:")
+        print(f"     - rpcuser={RPC_USER}")
+        print(f"     - rpcpassword={RPC_PASSWORD}")
+        print(f"     - rpcport={RPC_PORT}")
+        print(f"     - rpcallowip=127.0.0.1 (or 0.0.0.0/0 for all)")
+        print(f"     - rpcbind=127.0.0.1 (or 0.0.0.0 for all)")
+        print(f"  3. If using Docker, ensure the container is running:")
+        print(f"     docker ps | grep bitcoind")
+        print(f"  4. Verify the port is correct (18332 for testnet, 8332 for mainnet)")
+        print(f"  5. Check firewall settings")
+        return False
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 401:
+            print(f"✗ Authentication failed. Check RPC_USER and RPC_PASSWORD.")
+            print(f"  Current settings: user={RPC_USER}, password={'*' * len(RPC_PASSWORD)}")
+        else:
+            print(f"✗ HTTP error: {e}")
+        return False
+    except Exception as e:
+        print(f"✗ RPC connection test failed: {e}")
+        return False
+
 def rpc_call(method, params=None):
     payload = json.dumps({
         "jsonrpc": "1.0",
@@ -52,14 +89,21 @@ def rpc_call(method, params=None):
         "method": method,
         "params": params or []
     })
-    resp = requests.post(RPC_URL, auth=(RPC_USER, RPC_PASSWORD),
-                         headers={"content-type": "text/plain"},
-                         data=payload)
-    resp.raise_for_status()
-    r = resp.json()
-    if r.get("error"):
-        raise Exception(r["error"])
-    return r["result"]
+    try:
+        resp = requests.post(RPC_URL, auth=(RPC_USER, RPC_PASSWORD),
+                             headers={"content-type": "text/plain"},
+                             data=payload,
+                             timeout=30)
+        resp.raise_for_status()
+        r = resp.json()
+        if r.get("error"):
+            raise Exception(r["error"])
+        return r["result"]
+    except requests.exceptions.ConnectionError as e:
+        raise ConnectionError(f"Cannot connect to Bitcoin RPC at {RPC_URL}. "
+                            f"Is Bitcoin Core running? Error: {e}")
+    except requests.exceptions.Timeout as e:
+        raise TimeoutError(f"RPC request to {RPC_URL} timed out. Error: {e}")
 
 def rpc_batch_call(rpc_requests):
     """
@@ -84,11 +128,18 @@ def rpc_batch_call(rpc_requests):
             "params": params or []
         })
     
-    resp = requests.post(RPC_URL, auth=(RPC_USER, RPC_PASSWORD),
-                         headers={"content-type": "text/plain"},
-                         data=json.dumps(payload))
-    resp.raise_for_status()
-    results = resp.json()
+    try:
+        resp = requests.post(RPC_URL, auth=(RPC_USER, RPC_PASSWORD),
+                             headers={"content-type": "text/plain"},
+                             data=json.dumps(payload),
+                             timeout=60)
+        resp.raise_for_status()
+        results = resp.json()
+    except requests.exceptions.ConnectionError as e:
+        raise ConnectionError(f"Cannot connect to Bitcoin RPC at {RPC_URL}. "
+                            f"Is Bitcoin Core running? Error: {e}")
+    except requests.exceptions.Timeout as e:
+        raise TimeoutError(f"RPC batch request to {RPC_URL} timed out. Error: {e}")
     
     # Handle both single response (if only one request) and array response
     if not isinstance(results, list):
@@ -235,7 +286,7 @@ def process_single_block(height):
     
     try:
         blockhash = rpc_call("getblockhash", [height])
-        block = rpc_call("getblock", [blockhash, 3])
+        block = rpc_call("getblock", [blockhash, 2])
     except Exception as e:
         # Handle case where block is not yet available during sync
         error_msg = str(e)
@@ -253,6 +304,9 @@ def process_single_block(height):
     
     for tx in block.get("tx", []):
         txid = tx.get("txid", "")
+        if shutdown_requested:
+            print(f"Shutdown requested while scanning transactions for block {height}")
+            return False
         for idx, v in enumerate(tx.get("vout", [])):
             spk = v.get("scriptPubKey", {})
             address = address_from_vout(v)
@@ -273,6 +327,10 @@ def process_single_block(height):
                 continue
             prev_txid = vin.get("txid")
             prev_vout = int(vin.get("vout", 0))
+
+            if shutdown_requested:
+                print(f"Shutdown requested during processing of block {height}, aborting before database write")
+                return False
             vin_rows.append((
                 True,
                 txid,
@@ -287,6 +345,9 @@ def process_single_block(height):
         db_start = time.time()
         print(f"[Block {height}] Starting database write...")
         with db.get_db_cursor() as cur:
+            if shutdown_requested:
+                print(f"Shutdown requested before writing block {height} to database")
+                return False
             if vout_rows:
                 vout_start = time.time()
                 vout_count = len(vout_rows)
@@ -379,6 +440,13 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
 
         for tx in block.get("tx", []):
             txid = tx.get("txid", "")
+            if shutdown_requested:
+                print(f"Shutdown requested while preparing chunk data for block {height}")
+                return {
+                    'vout_rows': [],
+                    'vin_rows': [],
+                    'block_info': None
+                }
             for idx, v in enumerate(tx.get("vout", [])):
                 spk = v.get("scriptPubKey", {})
                 address = address_from_vout(v)
@@ -440,6 +508,14 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
             hash_batch_requests = [("getblockhash", [height], height) for height in to_process]
             try:
                 hash_results = rpc_batch_call(hash_batch_requests)
+            except (ConnectionError, TimeoutError) as e:
+                print(f"Error in batch getblockhash call: {e}")
+                print(f"Waiting {RECONNECT_DELAY} seconds before retry...")
+                time.sleep(RECONNECT_DELAY)
+                failed_blocks = to_process[:]
+                to_process = failed_blocks[:]
+                retries += 1
+                continue
             except Exception as e:
                 print(f"Error in batch getblockhash call: {e}")
                 failed_blocks = to_process[:]
@@ -450,7 +526,10 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
             # Build block fetch requests for successful hashes
             block_batch_requests = []
             height_to_hash = {}
-            for height in to_process:
+            # Limit batch of blocks to avoid overloading bitcoind memory
+            limited_heights = to_process[:MAX_RPC_BATCH]
+            remaining_heights = to_process[MAX_RPC_BATCH:]
+            for height in limited_heights:
                 if height in hash_results:
                     result = hash_results[height]
                     if isinstance(result, dict) and "error" in result:
@@ -467,6 +546,14 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
             if block_batch_requests:
                 try:
                     block_results = rpc_batch_call(block_batch_requests)
+                except (ConnectionError, TimeoutError) as e:
+                    print(f"Error in batch getblock call: {e}")
+                    print(f"Waiting {RECONNECT_DELAY} seconds before retry...")
+                    time.sleep(RECONNECT_DELAY)
+                    failed_blocks.extend([h for h in to_process if h not in failed_blocks])
+                    to_process = failed_blocks[:]
+                    retries += 1
+                    continue
                 except Exception as e:
                     print(f"Error in batch getblock call: {e}")
                     failed_blocks.extend([h for h in to_process if h not in failed_blocks])
@@ -475,7 +562,7 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                     continue
                 
                 # Process all fetched blocks
-                for height in to_process:
+                for height in limited_heights:
                     if height in failed_blocks:
                         continue
                     if height not in block_results:
@@ -495,9 +582,15 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                     
                     try:
                         block_data = process_block_data(block, height, blockhash)
+                        if shutdown_requested:
+                            print(f"Shutdown requested while processing chunk {chunk_start}-{chunk_end}, stopping block accumulation")
+                            failed_blocks.clear()
+                            to_process.clear()
+                            break
                         out_lists['vout_rows'].extend(block_data['vout_rows'])
                         out_lists['vin_rows'].extend(block_data['vin_rows'])
-                        out_lists['scanned'].append(block_data['block_info'])
+                        if block_data['block_info']:
+                            out_lists['scanned'].append(block_data['block_info'])
                     except Exception as e:
                         print(f"Error processing block {height}: {e}")
                         failed_blocks.append(height)
@@ -507,8 +600,11 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
             
             if failed_blocks:
                 print(f"Retrying {len(failed_blocks)} failed blocks in chunk {chunk_start}–{chunk_end} (attempt {retries+2}/{MAX_RETRIES})...")
-            to_process = failed_blocks[:]
+            # Re-queue failed first, then remaining heights of this chunk
+            to_process = failed_blocks[:] + remaining_heights[:]
             retries += 1
+            if shutdown_requested:
+                break
         
         fetch_time = time.time() - fetch_start
         if to_process:
@@ -516,74 +612,142 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
         else:
             print(f"[Chunk {chunk_start}-{chunk_end}] Fetched {chunk_end - chunk_start + 1} blocks in {fetch_time:.3f}s")
 
+        if shutdown_requested:
+            print(f"Skipping database write for chunk {chunk_start}-{chunk_end} due to shutdown request")
+            break
+
         try:
             db_start = time.time()
             print(f"[Chunk {chunk_start}-{chunk_end}] Starting database write...")
             with db.get_db_cursor() as cur:
+                if shutdown_requested:
+                    print(f"Shutdown requested before writing chunk {chunk_start}-{chunk_end} to database")
+                    break
+                # Speed up bulk load locally
+                cur.execute("SET LOCAL synchronous_commit = OFF")
+                cur.execute("SET LOCAL statement_timeout = 0")
                 if out_lists['vout_rows']:
                     vout_start = time.time()
                     vout_count = len(out_lists['vout_rows'])
-                    print(f"[Chunk {chunk_start}-{chunk_end}] Inserting {vout_count} UTXOs...")
-                    # Use execute_values for faster bulk inserts (uses COPY internally)
-                    # Increased page_size for better performance with large datasets (1M+ records)
-                    execute_values(cur,
-                        """
-                        INSERT INTO utxos (txid, vout, address, value_sat, script_pub_key_hex, script_pub_type, created_block, created_block_timestamp)
-                        VALUES %s
-                        ON CONFLICT (txid, vout) DO UPDATE SET
-                            address = EXCLUDED.address,
-                            value_sat = EXCLUDED.value_sat,
-                            script_pub_key_hex = EXCLUDED.script_pub_key_hex,
-                            script_pub_type = EXCLUDED.script_pub_type,
-                            created_block = EXCLUDED.created_block,
-                            created_block_timestamp = EXCLUDED.created_block_timestamp
-                        """,
-                        out_lists['vout_rows'], page_size=10000, template=None
-                    )
+                    print(f"[Chunk {chunk_start}-{chunk_end}] Staging {vout_count} UTXOs into temp table...")
+                    # Create staging table
+                    cur.execute("""
+                        CREATE TEMP TABLE temp_utxos (
+                            txid text,
+                            vout integer,
+                            address text,
+                            value_sat bigint,
+                            script_pub_key_hex text,
+                            script_pub_type text,
+                            created_block integer,
+                            created_block_timestamp bigint
+                        ) ON COMMIT DROP
+                    """)
+                    # Load into staging in pages
+                    for i in range(0, vout_count, DB_PAGE_ROWS):
+                        if shutdown_requested:
+                            print(f"Shutdown requested during staging UTXO insert")
+                            break
+                        slice_rows = out_lists['vout_rows'][i:i+DB_PAGE_ROWS]
+                        execute_values(cur, """
+                            INSERT INTO temp_utxos (txid, vout, address, value_sat, script_pub_key_hex, script_pub_type, created_block, created_block_timestamp)
+                            VALUES %s
+                        """, slice_rows, page_size=min(2000, DB_PAGE_ROWS), template=None)
+                    if not shutdown_requested:
+                        # Single upsert from staging (ordered for index locality)
+                        print(f"[Chunk {chunk_start}-{chunk_end}] Upserting staged UTXOs into main table...")
+                        cur.execute("""
+                            INSERT INTO utxos (txid, vout, address, value_sat, script_pub_key_hex, script_pub_type, created_block, created_block_timestamp)
+                            SELECT txid, vout, address, value_sat, script_pub_key_hex, script_pub_type, created_block, created_block_timestamp
+                            FROM temp_utxos
+                            ORDER BY txid, vout
+                            ON CONFLICT (txid, vout) DO UPDATE SET
+                                address = EXCLUDED.address,
+                                value_sat = EXCLUDED.value_sat,
+                                script_pub_key_hex = EXCLUDED.script_pub_key_hex,
+                                script_pub_type = EXCLUDED.script_pub_type,
+                                created_block = EXCLUDED.created_block,
+                                created_block_timestamp = EXCLUDED.created_block_timestamp
+                        """)
                     vout_time = time.time() - vout_start
                     print(f"[Chunk {chunk_start}-{chunk_end}] Inserted {vout_count} UTXOs in {vout_time:.3f}s")
+                    if shutdown_requested:
+                        print(f"Shutdown requested after UTXO insert for chunk {chunk_start}-{chunk_end}, aborting remaining work")
+                        break
 
                 if out_lists['vin_rows']:
                     vin_start = time.time()
                     vin_count = len(out_lists['vin_rows'])
-                    print(f"[Chunk {chunk_start}-{chunk_end}] Updating {vin_count} spent UTXOs...")
-                    # Use execute_batch for UPDATEs (execute_values doesn't support UPDATE well)
-                    # Increased page_size for better performance with large datasets (1M+ records)
-                    execute_batch(cur,
-                        """
-                        UPDATE utxos
-                        SET spent = %s,
-                            spent_by_txid = %s,
-                            spent_vin = %s,
-                            spent_block = %s,
-                            spent_block_timestamp = %s
-                        WHERE txid = %s AND vout = %s AND (spent IS DISTINCT FROM TRUE)
-                        """,
-                        out_lists['vin_rows'], page_size=10000
-                    )
+                    print(f"[Chunk {chunk_start}-{chunk_end}] Staging {vin_count} spend updates into temp table...")
+                    # Create staging table for updates
+                    cur.execute("""
+                        CREATE TEMP TABLE temp_spends (
+                            spent boolean,
+                            spent_by_txid text,
+                            spent_vin integer,
+                            spent_block integer,
+                            spent_block_timestamp bigint,
+                            prev_txid text,
+                            prev_vout integer
+                        ) ON COMMIT DROP
+                    """)
+                    for i in range(0, vin_count, DB_PAGE_ROWS):
+                        if shutdown_requested:
+                            print(f"Shutdown requested during staging spent updates")
+                            break
+                        slice_rows = out_lists['vin_rows'][i:i+DB_PAGE_ROWS]
+                        execute_values(cur, """
+                            INSERT INTO temp_spends (spent, spent_by_txid, spent_vin, spent_block, spent_block_timestamp, prev_txid, prev_vout)
+                            VALUES %s
+                        """, slice_rows, page_size=min(2000, DB_PAGE_ROWS), template=None)
+                    if not shutdown_requested:
+                        print(f"[Chunk {chunk_start}-{chunk_end}] Applying spend updates via join...")
+                        cur.execute("""
+                            UPDATE utxos u
+                            SET spent = s.spent,
+                                spent_by_txid = s.spent_by_txid,
+                                spent_vin = s.spent_vin,
+                                spent_block = s.spent_block,
+                                spent_block_timestamp = s.spent_block_timestamp
+                            FROM temp_spends s
+                            WHERE u.txid = s.prev_txid
+                              AND u.vout = s.prev_vout
+                              AND (u.spent IS DISTINCT FROM TRUE)
+                        """)
                     vin_time = time.time() - vin_start
                     print(f"[Chunk {chunk_start}-{chunk_end}] Updated {vin_count} spent UTXOs in {vin_time:.3f}s")
+                    if shutdown_requested:
+                        print(f"Shutdown requested after spent UTXO update for chunk {chunk_start}-{chunk_end}, aborting remaining work")
+                        break
 
                 if out_lists['scanned']:
                     block_log_start = time.time()
                     block_count = len(out_lists['scanned'])
                     block_vals = [(b['block_height'], b['block_hash'], b['block_timestamp']) for b in out_lists['scanned']]
-                    print(f"[Chunk {chunk_start}-{chunk_end}] Inserting {block_count} block_log entries...")
-                    # Use execute_values for batch insert (already imported from psycopg2.extras)
-                    # Increased page_size for better performance with large datasets
-                    execute_values(cur,
-                        """
-                        INSERT INTO block_log (block_height, block_hash, block_timestamp) VALUES %s
-                        """,
-                        block_vals, page_size=10000, template=None
-                    )
+                    print(f"[Chunk {chunk_start}-{chunk_end}] Inserting {block_count} block_log entries in pages of {DB_PAGE_ROWS}...")
+                    for i in range(0, block_count, DB_PAGE_ROWS):
+                        if shutdown_requested:
+                            print(f"Shutdown requested during block_log paging insert")
+                            break
+                        slice_rows = block_vals[i:i+DB_PAGE_ROWS]
+                        execute_values(cur,
+                            """
+                            INSERT INTO block_log (block_height, block_hash, block_timestamp) VALUES %s
+                            """,
+                            slice_rows, page_size=min(1000, DB_PAGE_ROWS), template=None
+                        )
+                    if shutdown_requested:
+                        print(f"Shutdown requested after block_log insert for chunk {chunk_start}-{chunk_end}")
                     block_log_time = time.time() - block_log_start
                     print(f"[Chunk {chunk_start}-{chunk_end}] Inserted {block_count} block_log entries in {block_log_time:.3f}s")
                 
                 # Refresh materialized views after each chunk during catch-up
                 # (chunks are large so refresh overhead is acceptable)
                 if REFRESH_INTERVAL >= 0:
-                    cur.execute("SELECT refresh_all_materialized_views()")
+                    if shutdown_requested:
+                        print(f"Skipping materialized view refresh due to shutdown request")
+                    else:
+                        cur.execute("SELECT refresh_all_materialized_views()")
             db_time = time.time() - db_start
             print(f"[Chunk {chunk_start}-{chunk_end}] Database write completed in {db_time:.3f}s")
             
@@ -623,6 +787,15 @@ def main():
     
     # Initial catch-up: process from last_processed to current tip
     print(f"Starting indexer. Last processed: {last}")
+    print(f"RPC Configuration: {RPC_HOST}:{RPC_PORT} (user: {RPC_USER})")
+    
+    # Test RPC connection before proceeding
+    print("\nTesting Bitcoin RPC connection...")
+    if not test_rpc_connection():
+        print("\nFatal: Cannot connect to Bitcoin RPC. Please fix the connection and try again.")
+        db.shutdown_pool()
+        sys.exit(1)
+    print()
     
     try:
         tip = rpc_call("getblockcount")
