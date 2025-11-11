@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
 """
-Find "quantum-at-risk" pubkeys (revealed pubkeys in inputs or raw pubkeys in P2PK outputs)
-in Bitcoin *testnet* blocks using your local bitcoind node via RPC.
+Bitcoin UTXO indexer - extracts VOUTs (UTXOs) from Bitcoin blocks
+and stores them in PostgreSQL for efficient querying.
 """
-from bitcoin.wallet import CBitcoinAddress, P2PKHBitcoinAddress, P2WPKHBitcoinAddress
-from bitcoin.core import x
-from bitcoin.core.script import CScript
-from bitcoin.core.key import CPubKey
 from bitcoin import SelectParams
 
 import requests, json
@@ -14,11 +10,13 @@ import time
 import signal
 import sys
 import os
+import io
 
 import psycopg2
 from psycopg2.extras import execute_batch, execute_values
 from . import db
 
+import csv
 from pycoin.symbols.btc import network
 
 # ========================
@@ -33,18 +31,15 @@ RPC_URL = f"http://{RPC_HOST}:{RPC_PORT}/"
 
 SelectParams(NETWORK)
 
-THREADS = 8                               # number of parallel workers
-INITIAL_BLOCKS = 100                      # number of historical blocks to scan on startup
 POLL_INTERVAL = 1.0                       # seconds between checking for new blocks
 RECONNECT_DELAY = 5.0                     # seconds to wait after connection error
 
 # Tuning knobs (can be overridden by env)
 CHUNK_SIZE = int(os.getenv('CHUNK_SIZE', '200'))                    # blocks per catch-up chunk
 MAX_RETRIES = int(os.getenv('MAX_RETRIES', '5'))                    # max retries for failed RPC
-REFRESH_INTERVAL = int(os.getenv('REFRESH_INTERVAL', '10'))         # MV refresh cadence
-VACUUM_INTERVAL = int(os.getenv('VACUUM_INTERVAL', '100'))          # VACUUM cadence in chunks
 MAX_RPC_BATCH = int(os.getenv('MAX_RPC_BATCH', '100'))              # cap per JSON-RPC batch
-DB_PAGE_ROWS = int(os.getenv('DB_PAGE_ROWS', '2000'))               # rows per DB insert/update page
+DB_PAGE_ROWS = int(os.getenv('DB_PAGE_ROWS', '10000'))              # rows per DB insert page
+IS_UTXO = bool(int(os.getenv('IS_UTXO', '1')))                      # whether indexing UTXOs (True) or TXOs (False)
 
 # ========================
 # RPC UTILS
@@ -209,46 +204,90 @@ def address_from_vout(v):
 # ========================
 # DB
 # ========================
-def get_db_conn():
-    host = os.getenv('PGHOST', '127.0.0.1')
-    port = int(os.getenv('PGPORT', '5432'))
-    db = os.getenv('PGDATABASE', 'postgres')
-    user = os.getenv('PGUSER', 'indexer')
-    password = os.getenv('PGPASSWORD', 'password')
-    return psycopg2.connect(host=host, port=port, dbname=db, user=user, password=password)
+def _format_row_fast(row):
+    """Fast row formatting for COPY - optimized for Bitcoin data (no tabs/newlines expected)."""
+    # For Bitcoin data, we rarely have special chars, so optimize the common case
+    parts = []
+    for val in row:
+        if val is None:
+            parts.append('\\N')
+        else:
+            # Most Bitcoin data (txid, address, hex) doesn't need escaping
+            # Only escape if we detect special characters (rare case)
+            s = str(val)
+            if '\\' in s or '\t' in s or '\n' in s or '\r' in s:
+                s = s.replace('\\', '\\\\').replace('\t', '\\t').replace('\n', '\\n').replace('\r', '\\r')
+            parts.append(s)
+    return '\t'.join(parts)
 
-# ========================
+def bulk_insert_utxos_copy(cur, utxo_rows):
+    """
+    Insert UTXOs using COPY FROM directly to main table for maximum performance.
+    No temp table overhead - COPY directly to utxos table.
+    """
+    if not utxo_rows:
+        return
+    
+    # Prepare data as StringIO for COPY - optimized formatting
+    # Use list comprehension and join for better performance
+    data_lines = [_format_row_fast(row) for row in utxo_rows]
+    data_stream = io.StringIO('\n'.join(data_lines))
+    data_stream.seek(0)
+    
+    # COPY directly to main table - no temp table overhead
+    cur.copy_from(
+        data_stream,
+        'utxos',
+        columns=('txid', 'vout', 'address', 'value_sat', 'script_pub_key_hex', 
+                 'script_pub_type', 'created_block', 'created_block_timestamp'),
+        null='\\N',
+        sep='\t'
+    )
+
+def bulk_insert_block_log_copy(cur, block_rows):
+    """Insert block_log entries using COPY FROM directly to main table."""
+    if not block_rows:
+        return
+    
+    # Prepare data as StringIO for COPY - optimized
+    data_lines = [_format_row_fast(row) for row in block_rows]
+    data_stream = io.StringIO('\n'.join(data_lines))
+    data_stream.seek(0)
+    
+    # COPY directly to main table
+    cur.copy_from(
+        data_stream,
+        'block_log',
+        columns=('block_height', 'block_hash', 'block_timestamp'),
+        null='\\N',
+        sep='\t'
+    )
+
 def schema_init():
     import os
     schema_path = os.path.join(os.path.dirname(__file__), "db", "schema.sql")
     db.init_pool()
-    try:
-        with db.get_db_cursor() as cur:
-            # Check if block_log table exists (indicates schema is already initialized)
-            cur.execute("""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables 
-                    WHERE table_schema = 'public' 
-                    AND table_name = 'block_log'
-                )
-            """)
-            table_exists = cur.fetchone()[0]
-            
-            if table_exists:
-                print("Schema already initialized (block_log table exists), skipping initialization.")
-                return
-            
-            # Schema not initialized, run the SQL
-            print("Initializing database schema...")
-            try:
-                with open(schema_path, "r") as sf:
-                    schema_sql = sf.read()
-                cur.execute(schema_sql)
-                print("Schema initialization completed.")
-            except FileNotFoundError:
-                raise
-    finally:
-        db.shutdown_pool()
+    with db.get_db_cursor() as cur:
+        # Check if block_log table exists (indicates schema is already initialized)
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_schema = 'public' 
+                AND table_name = 'block_log'
+            )
+        """)
+        table_exists = cur.fetchone()[0]
+        
+        if table_exists:
+            print("Schema already initialized (block_log table exists), skipping initialization.")
+            return
+        
+        # Schema not initialized, run the SQL
+        print("Initializing database schema...")
+        with open(schema_path, "r") as sf:
+            schema_sql = sf.read()
+        cur.execute(schema_sql)
+        print("Schema initialization completed.")
 
 # ========================
 # Global state for graceful shutdown
@@ -274,19 +313,14 @@ def get_last_processed_height():
         print(f"Error getting last processed height: {e}")
         return 0
 
-# Track blocks since last refresh for rate limiting
-_blocks_since_refresh = 0
-_chunks_processed = 0  # Track chunks for VACUUM maintenance
-
 def process_single_block(height):
-    """Process a single block and save to database immediately."""
-    global _blocks_since_refresh
+    """Process a single block and extract VOUTs (UTXOs) to database."""
     if shutdown_requested:
         return False
     
     try:
         blockhash = rpc_call("getblockhash", [height])
-        block = rpc_call("getblock", [blockhash, 2])
+        block = rpc_call("getblock", [blockhash, 3])
     except Exception as e:
         # Handle case where block is not yet available during sync
         error_msg = str(e)
@@ -300,7 +334,6 @@ def process_single_block(height):
     block_ts = int(block_time * 1_000_000_000)
     
     vout_rows = []
-    vin_rows = []
     
     for tx in block.get("tx", []):
         txid = tx.get("txid", "")
@@ -322,24 +355,6 @@ def process_single_block(height):
                 height,
                 block_ts
             ))
-        for vin_idx, vin in enumerate(tx.get("vin", [])):
-            if "txid" not in vin:
-                continue
-            prev_txid = vin.get("txid")
-            prev_vout = int(vin.get("vout", 0))
-
-            if shutdown_requested:
-                print(f"Shutdown requested during processing of block {height}, aborting before database write")
-                return False
-            vin_rows.append((
-                True,
-                txid,
-                vin_idx,
-                height,
-                block_ts,
-                prev_txid,
-                prev_vout
-            ))
     
     try:
         db_start = time.time()
@@ -348,74 +363,21 @@ def process_single_block(height):
             if shutdown_requested:
                 print(f"Shutdown requested before writing block {height} to database")
                 return False
+            # Performance settings for single block inserts
+            cur.execute("SET LOCAL synchronous_commit = OFF")
             if vout_rows:
                 vout_start = time.time()
                 vout_count = len(vout_rows)
-                print(f"[Block {height}] Inserting {vout_count} UTXOs...")
-                # Use execute_values for faster bulk inserts (uses COPY internally)
-                # Increased page_size for better performance with large datasets
-                execute_values(cur,
-                    """
-                    INSERT INTO utxos (txid, vout, address, value_sat, script_pub_key_hex, script_pub_type, created_block, created_block_timestamp)
-                    VALUES %s
-                    ON CONFLICT (txid, vout) DO UPDATE SET
-                        address = EXCLUDED.address,
-                        value_sat = EXCLUDED.value_sat,
-                        script_pub_key_hex = EXCLUDED.script_pub_key_hex,
-                        script_pub_type = EXCLUDED.script_pub_type,
-                        created_block = EXCLUDED.created_block,
-                        created_block_timestamp = EXCLUDED.created_block_timestamp
-                    """,
-                    vout_rows, page_size=10000, template=None
-                )
+                print(f"[Block {height}] Inserting {vout_count} UTXOs using COPY...")
+                # Use COPY FROM for fastest bulk inserts
+                bulk_insert_utxos_copy(cur, vout_rows)
                 vout_time = time.time() - vout_start
-                print(f"[Block {height}] Inserted {vout_count} UTXOs in {vout_time:.3f}s")
-            
-            if vin_rows:
-                vin_start = time.time()
-                vin_count = len(vin_rows)
-                print(f"[Block {height}] Updating {vin_count} spent UTXOs...")
-                # Use execute_batch for UPDATEs (execute_values doesn't support UPDATE well)
-                # Increased page_size for better performance with large datasets
-                execute_batch(cur,
-                    """
-                    UPDATE utxos
-                    SET spent = %s,
-                        spent_by_txid = %s,
-                        spent_vin = %s,
-                        spent_block = %s,
-                        spent_block_timestamp = %s
-                    WHERE txid = %s AND vout = %s AND (spent IS DISTINCT FROM TRUE)
-                    """,
-                    vin_rows, page_size=10000
-                )
-                vin_time = time.time() - vin_start
-                print(f"[Block {height}] Updated {vin_count} spent UTXOs in {vin_time:.3f}s")
+                if vout_time > 0:
+                    rows_per_sec = vout_count / vout_time
+                    print(f"[Block {height}] Inserted {vout_count} UTXOs in {vout_time:.3f}s ({rows_per_sec:.0f} rows/sec)")
             
             # Insert block log entry
-            block_log_start = time.time()
-            cur.execute(
-                """
-                INSERT INTO block_log (block_height, block_hash, block_timestamp)
-                VALUES (%s, %s, %s)
-                """,
-                (height, blockhash, block_ts)
-            )
-            block_log_time = time.time() - block_log_start
-            print(f"[Block {height}] Inserted block_log in {block_log_time:.3f}s")
-            
-            # Refresh materialized views periodically
-            # REFRESH_INTERVAL > 0: refresh every N blocks
-            # REFRESH_INTERVAL = 0: refresh every block (expensive)
-            # REFRESH_INTERVAL < 0: never refresh automatically
-            _blocks_since_refresh += 1
-            if REFRESH_INTERVAL > 0:
-                if _blocks_since_refresh >= REFRESH_INTERVAL:
-                    cur.execute("SELECT refresh_all_materialized_views()")
-                    _blocks_since_refresh = 0
-            elif REFRESH_INTERVAL == 0:
-                cur.execute("SELECT refresh_all_materialized_views()")
-                _blocks_since_refresh = 0
+            bulk_insert_block_log_copy(cur, [(height, blockhash, block_ts)])
         db_time = time.time() - db_start
         print(f"[Block {height}] Database write completed in {db_time:.3f}s")
         print(f"Processed block {height} ({blockhash[:16]}...)")
@@ -431,12 +393,11 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
     print(f"Processing blocks {start_height} → {end_height} in chunks of {chunk_size}")
 
     def process_block_data(block, height, blockhash):
-        """Process a single block's data and return rows."""
+        """Process a single block's data and extract VOUTs (UTXOs)."""
         block_time = block.get('time', 0)
         block_ts = int(block_time * 1_000_000_000)
 
         vout_rows = []
-        vin_rows = []
 
         for tx in block.get("tx", []):
             txid = tx.get("txid", "")
@@ -444,7 +405,6 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                 print(f"Shutdown requested while preparing chunk data for block {height}")
                 return {
                     'vout_rows': [],
-                    'vin_rows': [],
                     'block_info': None
                 }
             for idx, v in enumerate(tx.get("vout", [])):
@@ -462,24 +422,9 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                     height,
                     block_ts
                 ))
-            for vin_idx, vin in enumerate(tx.get("vin", [])):
-                if "txid" not in vin:
-                    continue
-                prev_txid = vin.get("txid")
-                prev_vout = int(vin.get("vout", 0))
-                vin_rows.append((
-                    True,
-                    txid,
-                    vin_idx,
-                    height,
-                    block_ts,
-                    prev_txid,
-                    prev_vout
-                ))
 
         return {
             'vout_rows': vout_rows,
-            'vin_rows': vin_rows,
             'block_info': {
                 "block_height": height,
                 "block_hash": blockhash,
@@ -495,7 +440,7 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
         chunk_end = min(chunk_start + chunk_size - 1, end_height)
         print(f"Processing chunk {chunk_start} → {chunk_end}")
 
-        out_lists = { 'vout_rows': [], 'vin_rows': [], 'scanned': [] }
+        out_lists = { 'vout_rows': [], 'scanned': [] }
         to_process = list(range(chunk_start, chunk_end + 1))
         failed_blocks = []
         retries = 0
@@ -588,7 +533,6 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                             to_process.clear()
                             break
                         out_lists['vout_rows'].extend(block_data['vout_rows'])
-                        out_lists['vin_rows'].extend(block_data['vin_rows'])
                         if block_data['block_info']:
                             out_lists['scanned'].append(block_data['block_info'])
                     except Exception as e:
@@ -623,154 +567,216 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                 if shutdown_requested:
                     print(f"Shutdown requested before writing chunk {chunk_start}-{chunk_end} to database")
                     break
-                # Speed up bulk load locally
+                # Speed up bulk load with performance settings
                 cur.execute("SET LOCAL synchronous_commit = OFF")
                 cur.execute("SET LOCAL statement_timeout = 0")
+                cur.execute("SET LOCAL maintenance_work_mem = '256MB'")
+                cur.execute("SET LOCAL work_mem = '64MB'")
+                    
                 if out_lists['vout_rows']:
                     vout_start = time.time()
                     vout_count = len(out_lists['vout_rows'])
-                    print(f"[Chunk {chunk_start}-{chunk_end}] Staging {vout_count} UTXOs into temp table...")
-                    # Create staging table
-                    cur.execute("""
-                        CREATE TEMP TABLE temp_utxos (
-                            txid text,
-                            vout integer,
-                            address text,
-                            value_sat bigint,
-                            script_pub_key_hex text,
-                            script_pub_type text,
-                            created_block integer,
-                            created_block_timestamp bigint
-                        ) ON COMMIT DROP
-                    """)
-                    # Load into staging in pages
-                    for i in range(0, vout_count, DB_PAGE_ROWS):
-                        if shutdown_requested:
-                            print(f"Shutdown requested during staging UTXO insert")
-                            break
-                        slice_rows = out_lists['vout_rows'][i:i+DB_PAGE_ROWS]
-                        execute_values(cur, """
-                            INSERT INTO temp_utxos (txid, vout, address, value_sat, script_pub_key_hex, script_pub_type, created_block, created_block_timestamp)
-                            VALUES %s
-                        """, slice_rows, page_size=min(2000, DB_PAGE_ROWS), template=None)
-                    if not shutdown_requested:
-                        # Single upsert from staging (ordered for index locality)
-                        print(f"[Chunk {chunk_start}-{chunk_end}] Upserting staged UTXOs into main table...")
-                        cur.execute("""
-                            INSERT INTO utxos (txid, vout, address, value_sat, script_pub_key_hex, script_pub_type, created_block, created_block_timestamp)
-                            SELECT txid, vout, address, value_sat, script_pub_key_hex, script_pub_type, created_block, created_block_timestamp
-                            FROM temp_utxos
-                            ORDER BY txid, vout
-                            ON CONFLICT (txid, vout) DO UPDATE SET
-                                address = EXCLUDED.address,
-                                value_sat = EXCLUDED.value_sat,
-                                script_pub_key_hex = EXCLUDED.script_pub_key_hex,
-                                script_pub_type = EXCLUDED.script_pub_type,
-                                created_block = EXCLUDED.created_block,
-                                created_block_timestamp = EXCLUDED.created_block_timestamp
-                        """)
+                    print(f"[Chunk {chunk_start}-{chunk_end}] Inserting {vout_count} UTXOs using COPY...")
+                    # Use COPY FROM for fastest bulk inserts
+                    bulk_insert_utxos_copy(cur, out_lists['vout_rows'])
                     vout_time = time.time() - vout_start
-                    print(f"[Chunk {chunk_start}-{chunk_end}] Inserted {vout_count} UTXOs in {vout_time:.3f}s")
+                    if vout_time > 0:
+                        rows_per_sec = vout_count / vout_time
+                        print(f"[Chunk {chunk_start}-{chunk_end}] Inserted {vout_count} UTXOs in {vout_time:.3f}s ({rows_per_sec:.0f} rows/sec)")
+                        if rows_per_sec < 5000:
+                            print(f"  Warning: Insert speed is low. Consider setting DROP_ADDRESS_INDEX=true or checking database configuration.")
+                    
                     if shutdown_requested:
-                        print(f"Shutdown requested after UTXO insert for chunk {chunk_start}-{chunk_end}, aborting remaining work")
-                        break
-
-                if out_lists['vin_rows']:
-                    vin_start = time.time()
-                    vin_count = len(out_lists['vin_rows'])
-                    print(f"[Chunk {chunk_start}-{chunk_end}] Staging {vin_count} spend updates into temp table...")
-                    # Create staging table for updates
-                    cur.execute("""
-                        CREATE TEMP TABLE temp_spends (
-                            spent boolean,
-                            spent_by_txid text,
-                            spent_vin integer,
-                            spent_block integer,
-                            spent_block_timestamp bigint,
-                            prev_txid text,
-                            prev_vout integer
-                        ) ON COMMIT DROP
-                    """)
-                    for i in range(0, vin_count, DB_PAGE_ROWS):
-                        if shutdown_requested:
-                            print(f"Shutdown requested during staging spent updates")
-                            break
-                        slice_rows = out_lists['vin_rows'][i:i+DB_PAGE_ROWS]
-                        execute_values(cur, """
-                            INSERT INTO temp_spends (spent, spent_by_txid, spent_vin, spent_block, spent_block_timestamp, prev_txid, prev_vout)
-                            VALUES %s
-                        """, slice_rows, page_size=min(2000, DB_PAGE_ROWS), template=None)
-                    if not shutdown_requested:
-                        print(f"[Chunk {chunk_start}-{chunk_end}] Applying spend updates via join...")
-                        cur.execute("""
-                            UPDATE utxos u
-                            SET spent = s.spent,
-                                spent_by_txid = s.spent_by_txid,
-                                spent_vin = s.spent_vin,
-                                spent_block = s.spent_block,
-                                spent_block_timestamp = s.spent_block_timestamp
-                            FROM temp_spends s
-                            WHERE u.txid = s.prev_txid
-                              AND u.vout = s.prev_vout
-                              AND (u.spent IS DISTINCT FROM TRUE)
-                        """)
-                    vin_time = time.time() - vin_start
-                    print(f"[Chunk {chunk_start}-{chunk_end}] Updated {vin_count} spent UTXOs in {vin_time:.3f}s")
-                    if shutdown_requested:
-                        print(f"Shutdown requested after spent UTXO update for chunk {chunk_start}-{chunk_end}, aborting remaining work")
+                        print(f"Shutdown requested after UTXO insert for chunk {chunk_start}-{chunk_end}")
                         break
 
                 if out_lists['scanned']:
                     block_log_start = time.time()
                     block_count = len(out_lists['scanned'])
                     block_vals = [(b['block_height'], b['block_hash'], b['block_timestamp']) for b in out_lists['scanned']]
-                    print(f"[Chunk {chunk_start}-{chunk_end}] Inserting {block_count} block_log entries in pages of {DB_PAGE_ROWS}...")
-                    for i in range(0, block_count, DB_PAGE_ROWS):
-                        if shutdown_requested:
-                            print(f"Shutdown requested during block_log paging insert")
-                            break
-                        slice_rows = block_vals[i:i+DB_PAGE_ROWS]
-                        execute_values(cur,
-                            """
-                            INSERT INTO block_log (block_height, block_hash, block_timestamp) VALUES %s
-                            """,
-                            slice_rows, page_size=min(1000, DB_PAGE_ROWS), template=None
-                        )
-                    if shutdown_requested:
-                        print(f"Shutdown requested after block_log insert for chunk {chunk_start}-{chunk_end}")
+                    print(f"[Chunk {chunk_start}-{chunk_end}] Inserting {block_count} block_log entries using COPY...")
+                    bulk_insert_block_log_copy(cur, block_vals)
                     block_log_time = time.time() - block_log_start
                     print(f"[Chunk {chunk_start}-{chunk_end}] Inserted {block_count} block_log entries in {block_log_time:.3f}s")
-                
-                # Refresh materialized views after each chunk during catch-up
-                # (chunks are large so refresh overhead is acceptable)
-                if REFRESH_INTERVAL >= 0:
-                    if shutdown_requested:
-                        print(f"Skipping materialized view refresh due to shutdown request")
-                    else:
-                        cur.execute("SELECT refresh_all_materialized_views()")
             db_time = time.time() - db_start
             print(f"[Chunk {chunk_start}-{chunk_end}] Database write completed in {db_time:.3f}s")
-            
-            # Periodic VACUUM ANALYZE for table maintenance (prevents bloat and keeps stats fresh)
-            global _chunks_processed
-            _chunks_processed += 1
-            if VACUUM_INTERVAL > 0 and _chunks_processed >= VACUUM_INTERVAL:
-                print(f"Running VACUUM ANALYZE (after {_chunks_processed} chunks)...")
-                vacuum_start = time.time()
-                with db.get_db_cursor() as vac_cur:
-                    vac_cur.execute("VACUUM ANALYZE utxos")
-                    vac_cur.execute("VACUUM ANALYZE block_log")
-                vacuum_time = time.time() - vacuum_start
-                print(f"VACUUM ANALYZE completed in {vacuum_time:.3f}s")
-                _chunks_processed = 0
-            elif VACUUM_INTERVAL == 0:
-                # Every chunk (only for testing - expensive!)
-                print("Running VACUUM ANALYZE after chunk...")
-                with db.get_db_cursor() as vac_cur:
-                    vac_cur.execute("VACUUM ANALYZE utxos")
         except Exception as e:
             print(f"Error writing chunk {chunk_start}-{chunk_end} to PostgreSQL: {e}")
         print(f"Saved and flushed chunk {chunk_start}–{chunk_end}")
+
+def get_script_type(script_hex: str, address: str) -> str:
+    """
+    Classifies scriptPubKey hex into one of: P2PK, P2PKH, P2SH, P2MS, P2WPKH, P2WSH, P2TR.
+    
+    Args:
+        script_hex: Hex string of scriptPubKey.
+    
+    Returns:
+        str: The type (e.g., 'P2PKH') or 'unknown'.
+    """
+    script = bytes.fromhex(script_hex)
+    
+    # Helper: Simple disassembler for pattern matching
+    def disassemble():
+        opcodes = {
+            0x76: 'OP_DUP', 0xa9: 'OP_HASH160', 0x88: 'OP_EQUALVERIFY', 0xac: 'OP_CHECKSIG',
+            0x87: 'OP_EQUAL', 0x51: 'OP_1', 0x52: 'OP_2', 0x53: 'OP_3', 0xae: 'OP_CHECKMULTISIG',
+            0x00: 'OP_0', 0x01: 'OP_1'  # OP_1 for P2TR
+        }
+        disasm = []
+        i = 0
+        while i < len(script):
+            op = script[i]
+            i += 1
+            if 1 <= op <= 75:  # OP_PUSHBYTES_N + data
+                data_len = op
+                if i + data_len > len(script):
+                    return ['ERROR']
+                data_hex = script[i:i + data_len].hex()
+                disasm.append(f'PUSH_{data_len}:{data_hex}')
+                i += data_len
+            else:
+                name = opcodes.get(op, f'OP_{op:02x}')
+                disasm.append(name)
+        return disasm
+    
+    disasm = disassemble()
+    
+    # P2PKH: OP_DUP OP_HASH160 PUSH_20 OP_EQUALVERIFY OP_CHECKSIG
+    if (len(disasm) == 5 and
+        disasm[0] == 'OP_DUP' and
+        disasm[1] == 'OP_HASH160' and
+        disasm[2].startswith('PUSH_20:') and
+        disasm[3] == 'OP_EQUALVERIFY' and
+        disasm[4] == 'OP_CHECKSIG'):
+        return 'P2PKH'
+    
+    # P2SH: OP_HASH160 PUSH_20 OP_EQUAL
+    if (len(disasm) == 3 and
+        disasm[0] == 'OP_HASH160' and
+        disasm[1].startswith('PUSH_20:') and
+        disasm[2] == 'OP_EQUAL'):
+        return 'P2SH'
+    
+    # P2WPKH: OP_0 PUSH_20
+    if (len(disasm) == 2 and
+        disasm[0] == 'OP_0' and
+        disasm[1].startswith('PUSH_20:')):
+        return 'P2WPKH'
+    
+    # P2WSH: OP_0 PUSH_32
+    if (len(disasm) == 2 and
+        disasm[0] == 'OP_0' and
+        disasm[1].startswith('PUSH_32:')):
+        return 'P2WSH'
+    
+    # P2TR: OP_1 PUSH_32
+    if (len(disasm) == 2 and
+        disasm[0] == 'OP_1' and
+        disasm[1].startswith('PUSH_32:')):
+        return 'P2TR'
+    
+    # P2PK: PUSH_33/65 OP_CHECKSIG
+    if (len(disasm) == 2 and disasm[1] == 'OP_CHECKSIG' and
+        (disasm[0].startswith('PUSH_33:') or disasm[0].startswith('PUSH_65:'))):
+        return 'P2PK'
+    
+    # P2MS: OP_N + >=2 PUSH_33/65 + OP_M + OP_CHECKMULTISIG (heuristic)
+    if (len(disasm) >= 4 and disasm[-1] == 'OP_CHECKMULTISIG' and
+        disasm[-2] in ['OP_1', 'OP_2', 'OP_3'] and disasm[0] in ['OP_1', 'OP_2', 'OP_3']):
+        pubkey_pushes = [d for d in disasm[1:-2] if d.startswith('PUSH_33:') or d.startswith('PUSH_65:')]
+        if len(pubkey_pushes) >= 2:
+            return 'P2MS'
+    
+    if address.startswith('bc1p'):
+        return 'Bech32'
+    
+    return 'unknown'
+
+from typing import Generator, Dict, Any, List
+from collections import defaultdict
+
+def read_utxo(batch_size: int = 1_000_000):
+    batch: List[tuple] = []
+    type_counts: Dict[str, int] = defaultdict(int)
+    total_utxo = 0
+
+    insert_sql = """
+        INSERT INTO utxos (
+            txid, vout, address, value_sat, script_pub_key_hex, script_pub_type,
+            created_block, created_block_timestamp
+        ) VALUES %s
+    """
+
+    with db.get_db_cursor() as cur:
+        cur.execute("ALTER TABLE utxos DROP CONSTRAINT utxos_pkey;")
+        cur.connection.commit()
+
+    with open('./data/utxo.csv', 'r') as f:
+        reader = csv.reader(f, delimiter=',')
+        for line_num, fields in enumerate(reader, start=1):
+            if len(fields) != 6:
+                print(f"Warning: Skipping malformed line {line_num} (expected 6 fields, got {len(fields)})", file=sys.stderr)
+                continue
+
+            try:
+                outpoint_parts = fields[0].split(':', 1)
+                txid = outpoint_parts[0].strip()
+                vout = int(outpoint_parts[1].strip())
+
+                block_height = int(fields[2].strip())
+                amount = int(fields[3].strip())
+                script_pub_key = fields[4].strip()
+                address = fields[5].strip()
+                script_type = get_script_type(script_pub_key, address)
+                type_counts[script_type] += 1
+                total_utxo += 1
+
+                if address == '':
+                    continue
+                
+                row_tuple = (
+                    txid, vout, address, amount, script_pub_key,
+                    script_type, block_height, 0
+                )
+                
+                batch.append(row_tuple)
+
+                if len(batch) >= batch_size:
+                    print(f"Inserting batch of {len(batch)} rows...", file=sys.stderr)
+                    start = time.time()
+                    with db.get_db_cursor() as cur:
+                            execute_values(cur, insert_sql, batch, page_size=1000)
+                            cur.connection.commit()
+                    print(f"Inserted batch: {total_utxo} total rows in {time.time() - start}", file=sys.stderr)
+                    batch = []
+            
+            except (ValueError, IndexError) as e:
+                print(f"Warning: Skipping line {line_num} due to parse error: {e}", file=sys.stderr)
+                continue
+
+    stats_upsert_sql = """
+        INSERT INTO stats (key, value) VALUES %s
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+    """
+
+    stats_batch = [('total_utxo', total_utxo)]
+    for script_type, count in type_counts.items():
+        key = f"{script_type}_count"
+        stats_batch.append((key, count))
+
+    start = time.time()
+    print(f"Inserting final batch of {len(batch)} rows...", file=sys.stderr)
+    with db.get_db_cursor() as cur:
+        execute_values(cur, stats_upsert_sql, stats_batch)
+        cur.execute("ALTER TABLE utxos ADD PRIMARY KEY (txid, vout);")
+        cur.execute("CREATE INDEX IF NOT EXISTS utxos_address_idx ON utxos (address);")
+        cur.connection.commit()
+        print(f"Inserted stats and created indexes in {time.time() - start}", file=sys.stderr)
+
+    print(f"UTXO import complete. Total rows inserted: {total_utxo}", file=sys.stderr)
+
+    return
 
 def main():
     global shutdown_requested
@@ -795,18 +801,32 @@ def main():
         print("\nFatal: Cannot connect to Bitcoin RPC. Please fix the connection and try again.")
         db.shutdown_pool()
         sys.exit(1)
-    print()
     
     try:
         tip = rpc_call("getblockcount")
         start = max(0, last + 1)
         
-        if start <= tip:
-            print(f"Catching up: processing blocks {start} → {tip}")
-            process_range(start, tip)
+        print(f"Tippity top: {tip} | Starting from: {start}")
+        
+        if IS_UTXO:
+            print("UTXO mode enabled - skipping historical block processing")
+            read_utxo()
+
+        # move it to the end
+        print("Shutdown complete. Cleaning up...")
+        db.shutdown_pool()
+        return
+    
+        # elif start <= tip:
+        #     print(f"Catching up: processing blocks {start} → {tip}")
+        #     process_range(start, tip)
         
         # Continuous polling loop
         print("Catch-up complete. Entering continuous sync mode...")
+
+        # Recreate address index if missing
+        with db.get_db_cursor() as cur:
+            cur.execute("CREATE INDEX IF NOT EXISTS utxos_address_idx ON utxos (address)")
         
         while not shutdown_requested:
             try:
@@ -840,9 +860,6 @@ def main():
             except Exception as e:
                 print(f"Unexpected error in polling loop: {e}")
                 time.sleep(RECONNECT_DELAY)
-        
-        print("Shutdown complete. Cleaning up...")
-        db.shutdown_pool()
         
     except KeyboardInterrupt:
         print("\nInterrupted by user")
