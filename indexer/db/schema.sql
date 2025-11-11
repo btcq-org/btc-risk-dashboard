@@ -16,24 +16,6 @@ $$;
 
 -- TABLES --
 
--- address table to keep track of address metadata
--- scriptPubKey is the latest known scriptPubKey type for the address UTXO
--- scriptSig shows if the address has re-used its scriptSig (P2PKH, P2SH, etc)
-
-CREATE TABLE IF NOT EXISTS addresses (
-    address TEXT NOT NULL,
-    first_seen_block BIGINT,
-    last_seen_block BIGINT,
-    tx_count BIGINT DEFAULT 0,
-    script_pub_type TEXT,
-    script_sig_type TEXT,
-    balance_sat BIGINT DEFAULT 0,
-    block_timestamp BIGINT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS addresses_address_idx ON addresses (address);
-CREATE INDEX IF NOT EXISTS addresses_block_timestamp_idx ON addresses (block_timestamp DESC);
-
 CREATE TABLE IF NOT EXISTS block_log (
     block_height BIGINT NOT NULL,
     block_hash TEXT,
@@ -57,7 +39,7 @@ CREATE TABLE IF NOT EXISTS utxos (
     script_pub_key_hex TEXT,
     script_pub_type TEXT,
     created_block BIGINT NOT NULL,
-    created_block_timestamp BIGINT NOT NULL,
+    created_block_timestamp BIGINT,
     spent BOOLEAN NOT NULL DEFAULT FALSE,
     spent_by_txid TEXT,
     spent_vin INTEGER,
@@ -66,15 +48,8 @@ CREATE TABLE IF NOT EXISTS utxos (
     PRIMARY KEY (txid, vout)
 );
 
--- Index on address for lookups (TEXT index for equality checks)
-CREATE INDEX IF NOT EXISTS utxos_address_idx ON utxos (address);
--- Index on spent flag for filtering unspent UTXOs
-CREATE INDEX IF NOT EXISTS utxos_spent_idx ON utxos (spent);
--- Index for ordering by creation block (descending for newest first)
-CREATE INDEX IF NOT EXISTS utxos_created_block_idx ON utxos (created_block DESC);
--- Partial index for spent UTXOs by block (smaller, faster)
-CREATE INDEX IF NOT EXISTS utxos_spent_block_idx ON utxos (spent_block DESC) WHERE spent;
--- Note: PRIMARY KEY (txid, vout) already provides index for UPDATE/ON CONFLICT queries
+-- Index on address for lookups
+-- CREATE INDEX IF NOT EXISTS utxos_address_idx ON utxos (address);
 
 -- =======================
 -- Address Status (computed from UTXOs)
@@ -247,3 +222,12 @@ BEGIN
     REFRESH MATERIALIZED VIEW block_stats;
 END;
 $$;
+
+-- =======================
+-- STATS
+-- =======================
+
+CREATE TABLE IF NOT EXISTS stats (
+    key TEXT PRIMARY KEY,
+    value BIGINT NOT NULL
+);
