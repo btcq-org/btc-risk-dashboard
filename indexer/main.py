@@ -39,7 +39,7 @@ CHUNK_SIZE = int(os.getenv('CHUNK_SIZE', '200'))                    # blocks per
 MAX_RETRIES = int(os.getenv('MAX_RETRIES', '5'))                    # max retries for failed RPC
 MAX_RPC_BATCH = int(os.getenv('MAX_RPC_BATCH', '100'))              # cap per JSON-RPC batch
 DB_PAGE_ROWS = int(os.getenv('DB_PAGE_ROWS', '10000'))              # rows per DB insert page
-IS_UTXO = bool(int(os.getenv('IS_UTXO', '1')))                      # whether indexing UTXOs (True) or TXOs (False)
+IS_UTXO = bool(int(os.getenv('IS_UTXO', '0')))                      # whether indexing UTXOs (True) or TXOs (False)
 
 # ========================
 # RPC UTILS
@@ -696,7 +696,7 @@ def get_script_type(script_hex: str, address: str) -> str:
 from typing import Generator, Dict, Any, List
 from collections import defaultdict
 
-def read_utxo(batch_size: int = 1_000_000):
+def read_utxo(height: int = 840_000,batch_size: int = 1_000_000):
     batch: List[tuple] = []
     type_counts: Dict[str, int] = defaultdict(int)
     total_utxo = 0
@@ -748,7 +748,7 @@ def read_utxo(batch_size: int = 1_000_000):
                     with db.get_db_cursor() as cur:
                             execute_values(cur, insert_sql, batch, page_size=1000)
                             cur.connection.commit()
-                    print(f"Inserted batch: {total_utxo} total rows in {time.time() - start}", file=sys.stderr)
+                    print(f"Inserted batch: {total_utxo} total rows", file=sys.stderr)
                     batch = []
             
             except (ValueError, IndexError) as e:
@@ -768,12 +768,15 @@ def read_utxo(batch_size: int = 1_000_000):
     start = time.time()
     print(f"Inserting final batch of {len(batch)} rows...", file=sys.stderr)
     with db.get_db_cursor() as cur:
+        if len(batch) > 0:
+            execute_values(cur, insert_sql, batch, page_size=1000)
         execute_values(cur, stats_upsert_sql, stats_batch)
         cur.execute("ALTER TABLE utxos ADD PRIMARY KEY (txid, vout);")
         cur.execute("CREATE INDEX IF NOT EXISTS utxos_address_idx ON utxos (address);")
+        cur.execute("INSERT INTO block_log (block_height, block_hash, block_timestamp) VALUES (0, '0'*64, 0) ON CONFLICT DO NOTHING;")
         cur.connection.commit()
         print(f"Inserted stats and created indexes in {time.time() - start}", file=sys.stderr)
-
+    
     print(f"UTXO import complete. Total rows inserted: {total_utxo}", file=sys.stderr)
 
     return
@@ -807,19 +810,14 @@ def main():
         start = max(0, last + 1)
         
         print(f"Tippity top: {tip} | Starting from: {start}")
-        
+
         if IS_UTXO:
             print("UTXO mode enabled - skipping historical block processing")
             read_utxo()
 
-        # move it to the end
-        print("Shutdown complete. Cleaning up...")
-        db.shutdown_pool()
-        return
-    
-        # elif start <= tip:
-        #     print(f"Catching up: processing blocks {start} → {tip}")
-        #     process_range(start, tip)
+        elif start <= tip:
+            print(f"Catching up: processing blocks {start} → {tip}")
+            process_range(start, tip)
         
         # Continuous polling loop
         print("Catch-up complete. Entering continuous sync mode...")
@@ -860,6 +858,9 @@ def main():
             except Exception as e:
                 print(f"Unexpected error in polling loop: {e}")
                 time.sleep(RECONNECT_DELAY)
+    
+        print("Shutdown complete. Cleaning up...")
+        db.shutdown_pool()
         
     except KeyboardInterrupt:
         print("\nInterrupted by user")
