@@ -11,12 +11,13 @@ import signal
 import sys
 import os
 
-import psycopg2
+from typing import Generator, Dict, Any, List
+from collections import defaultdict
 from psycopg2.extras import execute_batch, execute_values
 from . import db
+from .utils import detect_script_type, address_from_vout, get_script_type
 
 import csv
-from pycoin.symbols.btc import network
 
 # ========================
 # CONFIGURATION
@@ -189,51 +190,6 @@ def rpc_batch_call(rpc_requests, description="RPC batch request"):
 # ========================
 # Utils
 # =======================
-def detect_script_type(spk):
-        """Detect scriptPubKey type for common and rare types."""
-        if not spk:
-            return None
-        
-        script_type_map = {
-            "pubkey": "P2PK",
-            "pubkeyhash": "P2PKH", 
-            "scripthash": "P2SH",
-            "multisig": "P2MS",
-            "witness_v0_keyhash": "P2WPKH",
-            "witness_v0_scripthash": "P2WSH",
-            "v1_p2tr": "P2TR",
-            "witness_v1_taproot": "P2TR",
-            "nulldata": "OP_RETURN",
-            "op_return": "OP_RETURN",
-            "nonstandard": "nonstandard"
-        }
-        
-        return script_type_map.get(spk.get("type"), "nonstandard")
-
-def address_from_vout(v):
-    """Extract address from vout's scriptPubKey.addresses array (Bitcoin Core RPC format)."""
-    if not v:
-        return None
-    spk = v.get("scriptPubKey", {})
-    if not spk:
-        return None
-    addresses = spk.get("addresses", [])
-    if addresses and len(addresses) > 0:
-        return addresses[0]
-    # Fallback: try address field directly (some RPC versions use this)
-    address = spk.get("address")
-    if address:
-        return address
-    
-    script_hex = v.get("scriptPubKey", {}).get("hex")
-    if script_hex:
-        script_bytes = bytes.fromhex(script_hex)
-        address = network.address.for_script(script_bytes)
-        if address:
-            return str(address)
-
-    return None
-
 # ========================
 # DB
 # ========================
@@ -536,99 +492,6 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
         except Exception as e:
             print(f"Error writing chunk {chunk_start}-{chunk_end} to PostgreSQL: {e}")
         print(f"Saved and flushed chunk {chunk_start}–{chunk_end}")
-
-
-def get_script_type(script_hex: str, address: str) -> str:
-    """
-    Classifies scriptPubKey hex into one of: P2PK, P2PKH, P2SH, P2MS, P2WPKH, P2WSH, P2TR.
-    
-    Args:
-        script_hex: Hex string of scriptPubKey.
-    
-    Returns:
-        str: The type (e.g., 'P2PKH') or 'unknown'.
-    """
-    script = bytes.fromhex(script_hex)
-    
-    # Helper: Simple disassembler for pattern matching
-    def disassemble():
-        opcodes = {
-            0x76: 'OP_DUP', 0xa9: 'OP_HASH160', 0x88: 'OP_EQUALVERIFY', 0xac: 'OP_CHECKSIG',
-            0x87: 'OP_EQUAL', 0x51: 'OP_1', 0x52: 'OP_2', 0x53: 'OP_3', 0xae: 'OP_CHECKMULTISIG',
-            0x00: 'OP_0', 0x01: 'OP_1'  # OP_1 for P2TR
-        }
-        disasm = []
-        i = 0
-        while i < len(script):
-            op = script[i]
-            i += 1
-            if 1 <= op <= 75:  # OP_PUSHBYTES_N + data
-                data_len = op
-                if i + data_len > len(script):
-                    return ['ERROR']
-                data_hex = script[i:i + data_len].hex()
-                disasm.append(f'PUSH_{data_len}:{data_hex}')
-                i += data_len
-            else:
-                name = opcodes.get(op, f'OP_{op:02x}')
-                disasm.append(name)
-        return disasm
-    
-    disasm = disassemble()
-    
-    # P2PKH: OP_DUP OP_HASH160 PUSH_20 OP_EQUALVERIFY OP_CHECKSIG
-    if (len(disasm) == 5 and
-        disasm[0] == 'OP_DUP' and
-        disasm[1] == 'OP_HASH160' and
-        disasm[2].startswith('PUSH_20:') and
-        disasm[3] == 'OP_EQUALVERIFY' and
-        disasm[4] == 'OP_CHECKSIG'):
-        return 'P2PKH'
-    
-    # P2SH: OP_HASH160 PUSH_20 OP_EQUAL
-    if (len(disasm) == 3 and
-        disasm[0] == 'OP_HASH160' and
-        disasm[1].startswith('PUSH_20:') and
-        disasm[2] == 'OP_EQUAL'):
-        return 'P2SH'
-    
-    # P2WPKH: OP_0 PUSH_20
-    if (len(disasm) == 2 and
-        disasm[0] == 'OP_0' and
-        disasm[1].startswith('PUSH_20:')):
-        return 'P2WPKH'
-    
-    # P2WSH: OP_0 PUSH_32
-    if (len(disasm) == 2 and
-        disasm[0] == 'OP_0' and
-        disasm[1].startswith('PUSH_32:')):
-        return 'P2WSH'
-    
-    # P2TR: OP_1 PUSH_32
-    if (len(disasm) == 2 and
-        disasm[0] == 'OP_1' and
-        disasm[1].startswith('PUSH_32:')):
-        return 'P2TR'
-    
-    # P2PK: PUSH_33/65 OP_CHECKSIG
-    if (len(disasm) == 2 and disasm[1] == 'OP_CHECKSIG' and
-        (disasm[0].startswith('PUSH_33:') or disasm[0].startswith('PUSH_65:'))):
-        return 'P2PK'
-    
-    # P2MS: OP_N + >=2 PUSH_33/65 + OP_M + OP_CHECKMULTISIG (heuristic)
-    if (len(disasm) >= 4 and disasm[-1] == 'OP_CHECKMULTISIG' and
-        disasm[-2] in ['OP_1', 'OP_2', 'OP_3'] and disasm[0] in ['OP_1', 'OP_2', 'OP_3']):
-        pubkey_pushes = [d for d in disasm[1:-2] if d.startswith('PUSH_33:') or d.startswith('PUSH_65:')]
-        if len(pubkey_pushes) >= 2:
-            return 'P2MS'
-    
-    if address.startswith('bc1p'):
-        return 'Bech32'
-    
-    return 'unknown'
-
-from typing import Generator, Dict, Any, List
-from collections import defaultdict
 
 def read_utxo(height: int = 840_000,batch_size: int = 1_000_000):
     batch: List[tuple] = []
