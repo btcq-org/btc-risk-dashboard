@@ -35,7 +35,7 @@ POLL_INTERVAL = 1.0                       # seconds between checking for new blo
 RECONNECT_DELAY = 5.0                     # seconds to wait after connection error
 
 # Tuning knobs (can be overridden by env)
-CHUNK_SIZE = int(os.getenv('CHUNK_SIZE', '50'))                    # blocks per catch-up chunk
+CHUNK_SIZE = int(os.getenv('CHUNK_SIZE', '10'))                    # blocks per catch-up chunk
 MAX_RETRIES = int(os.getenv('MAX_RETRIES', '5'))                    # max retries for failed RPC
 DB_PAGE_ROWS = int(os.getenv('DB_PAGE_ROWS', '1000'))              # rows per DB insert page
 IS_UTXO = bool(int(os.getenv('IS_UTXO', '0')))                      # whether indexing UTXOs (True) or TXOs (False)
@@ -232,6 +232,39 @@ def bulk_insert_block_log_copy(cur, block_rows):
 
     execute_values(cur, insert_sql, block_rows, page_size=DB_PAGE_ROWS)
 
+def prepare_stats_batch(total_utxo: int, type_counts: Dict[str, int]) -> List[tuple]:
+    """
+    Prepare stats records for insertion/upsert.
+    """
+    stats_batch = []
+    if total_utxo:
+        stats_batch.append(('total_utxo', total_utxo))
+    for script_type, count in type_counts.items():
+        stats_batch.append((f"{script_type}_count", count))
+    return stats_batch
+
+def upsert_stats(cur, stats_batch: List[tuple], *, absolute: bool = False):
+    """
+    Upsert stats into the stats table.
+    When absolute=True, values overwrite existing entries.
+    Otherwise, values are incremented.
+    """
+    if not stats_batch:
+        return
+
+    if absolute:
+        stats_upsert_sql = """
+            INSERT INTO stats (key, value) VALUES %s
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """
+    else:
+        stats_upsert_sql = """
+            INSERT INTO stats (key, value) VALUES %s
+            ON CONFLICT (key) DO UPDATE SET value = stats.value + EXCLUDED.value
+        """
+
+    execute_values(cur, stats_upsert_sql, stats_batch)
+
 def schema_init():
     import os
     schema_path = os.path.join(os.path.dirname(__file__), "db", "schema.sql")
@@ -303,6 +336,8 @@ def process_single_block(height):
     block_ts = int(block_time * 1_000_000_000)
     
     vout_rows = []
+    type_counts: Dict[str, int] = defaultdict(int)
+    total_utxo = 0
     
     for tx in block.get("tx", []):
         txid = tx.get("txid", "")
@@ -314,16 +349,19 @@ def process_single_block(height):
             address = address_from_vout(v)
             value_btc = float(v.get("value", 0))
             value_sat = int(value_btc * 100_000_000)
+            script_type = detect_script_type(spk)
             vout_rows.append((
                 txid,
                 idx,
                 address or None,
                 value_sat,
                 spk.get("hex", ""),
-                detect_script_type(spk),
+                script_type,
                 height,
                 block_ts
             ))
+            type_counts[script_type] += 1
+            total_utxo += 1
     
     try:
         db_start = time.time()
@@ -347,6 +385,8 @@ def process_single_block(height):
             
             # Insert block log entry
             bulk_insert_block_log_copy(cur, [(height, blockhash, block_ts)])
+            stats_batch = prepare_stats_batch(total_utxo, dict(type_counts))
+            upsert_stats(cur, stats_batch)
         db_time = time.time() - db_start
         print(f"[Block {height}] Database write completed in {db_time:.3f}s")
         print(f"Processed block {height} ({blockhash[:16]}...)")
@@ -367,6 +407,8 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
         block_ts = int(block_time * 1_000_000_000)
 
         vout_rows = []
+        type_counts: Dict[str, int] = defaultdict(int)
+        total_utxo = 0
 
         for tx in block.get("tx", []):
             txid = tx.get("txid", "")
@@ -381,16 +423,19 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                 address = address_from_vout(v)
                 value_btc = float(v.get("value", 0))
                 value_sat = int(value_btc * 100_000_000)
+                script_type = detect_script_type(spk)
                 vout_rows.append((
                     txid,
                     idx,
                     address or None,
                     value_sat,
                     spk.get("hex", ""),
-                    detect_script_type(spk),
+                    script_type,
                     height,
                     block_ts
                 ))
+                type_counts[script_type] += 1
+                total_utxo += 1
 
         return {
             'vout_rows': vout_rows,
@@ -398,6 +443,10 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                 "block_height": height,
                 "block_hash": blockhash,
                 "block_timestamp": block_ts
+            },
+            'stats': {
+                'total_utxo': total_utxo,
+                'type_counts': dict(type_counts)
             }
         }
 
@@ -411,6 +460,8 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
 
         out_lists = {'vout_rows': [], 'scanned': []}
         chunk_heights = list(range(chunk_start, chunk_end + 1))
+        chunk_type_counts: Dict[str, int] = defaultdict(int)
+        chunk_total_utxo = 0
 
         if not chunk_heights:
             continue
@@ -446,6 +497,10 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
             out_lists['vout_rows'].extend(block_data['vout_rows'])
             if block_data['block_info']:
                 out_lists['scanned'].append(block_data['block_info'])
+            block_stats = block_data.get('stats', {})
+            chunk_total_utxo += block_stats.get('total_utxo', 0)
+            for script_type, count in block_stats.get('type_counts', {}).items():
+                chunk_type_counts[script_type] += count
 
         if shutdown_requested:
             break
@@ -469,14 +524,11 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                     vout_start = time.time()
                     vout_count = len(out_lists['vout_rows'])
                     print(f"[Chunk {chunk_start}-{chunk_end}] Inserting {vout_count} UTXOs ...")
-                    # Use COPY FROM for fastest bulk inserts
                     bulk_insert_utxos_copy(cur, out_lists['vout_rows'])
                     vout_time = time.time() - vout_start
                     if vout_time > 0:
                         rows_per_sec = vout_count / vout_time
                         print(f"[Chunk {chunk_start}-{chunk_end}] Inserted {vout_count} UTXOs in {vout_time:.3f}s ({rows_per_sec:.0f} rows/sec)")
-                        if rows_per_sec < 5000:
-                            print(f"  Warning: Insert speed is low. Consider setting DROP_ADDRESS_INDEX=true or checking database configuration.")
 
                 if out_lists['scanned']:
                     block_log_start = time.time()
@@ -486,6 +538,9 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                     bulk_insert_block_log_copy(cur, block_vals)
                     block_log_time = time.time() - block_log_start
                     print(f"[Chunk {chunk_start}-{chunk_end}] Inserted {block_count} block_log entries in {block_log_time:.3f}s")
+                
+                stats_batch = prepare_stats_batch(chunk_total_utxo, dict(chunk_type_counts))
+                upsert_stats(cur, stats_batch)
 
             db_time = time.time() - db_start
             print(f"[Chunk {chunk_start}-{chunk_end}] Database write completed in {db_time:.3f}s")
@@ -552,22 +607,14 @@ def read_utxo(height: int = 840_000,batch_size: int = 1_000_000):
                 print(f"Warning: Skipping line {line_num} due to parse error: {e}", file=sys.stderr)
                 continue
 
-    stats_upsert_sql = """
-        INSERT INTO stats (key, value) VALUES %s
-        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-    """
-
-    stats_batch = [('total_utxo', total_utxo)]
-    for script_type, count in type_counts.items():
-        key = f"{script_type}_count"
-        stats_batch.append((key, count))
+    stats_batch = prepare_stats_batch(total_utxo, dict(type_counts))
 
     start = time.time()
     print(f"Inserting final batch of {len(batch)} rows...", file=sys.stderr)
     with db.get_db_cursor() as cur:
         if len(batch) > 0:
             execute_values(cur, insert_sql, batch, page_size=1000)
-        execute_values(cur, stats_upsert_sql, stats_batch)
+        upsert_stats(cur, stats_batch, absolute=True)
         cur.execute("ALTER TABLE utxos ADD PRIMARY KEY (txid, vout);")
         cur.execute("CREATE INDEX IF NOT EXISTS utxos_address_idx ON utxos (address);")
         cur.execute("INSERT INTO block_log (block_height, block_hash, block_timestamp) VALUES (0, '0'*64, 0) ON CONFLICT DO NOTHING;")
@@ -615,6 +662,11 @@ def main():
         if start <= tip:
             print(f"Catching up: processing blocks {start} → {tip}")
             process_range(start, tip)
+
+        if shutdown_requested:
+            print("Shutdown requested during catch-up, exiting...")
+            db.shutdown_pool()
+            sys.exit(0)
         
         # Continuous polling loop
         print("Catch-up complete. Entering continuous sync mode...")
@@ -622,6 +674,7 @@ def main():
         # Recreate address index if missing
         with db.get_db_cursor() as cur:
             cur.execute("CREATE INDEX IF NOT EXISTS utxos_address_idx ON utxos (address);")
+            cur.execute("ALTER TABLE utxos ADD PRIMARY KEY (txid, vout);")
             cur.connection.commit()
         
         while not shutdown_requested:
