@@ -10,7 +10,6 @@ import time
 import signal
 import sys
 import os
-import io
 
 import psycopg2
 from psycopg2.extras import execute_batch, execute_values
@@ -35,10 +34,9 @@ POLL_INTERVAL = 1.0                       # seconds between checking for new blo
 RECONNECT_DELAY = 5.0                     # seconds to wait after connection error
 
 # Tuning knobs (can be overridden by env)
-CHUNK_SIZE = int(os.getenv('CHUNK_SIZE', '200'))                    # blocks per catch-up chunk
+CHUNK_SIZE = int(os.getenv('CHUNK_SIZE', '50'))                    # blocks per catch-up chunk
 MAX_RETRIES = int(os.getenv('MAX_RETRIES', '5'))                    # max retries for failed RPC
-MAX_RPC_BATCH = int(os.getenv('MAX_RPC_BATCH', '100'))              # cap per JSON-RPC batch
-DB_PAGE_ROWS = int(os.getenv('DB_PAGE_ROWS', '10000'))              # rows per DB insert page
+DB_PAGE_ROWS = int(os.getenv('DB_PAGE_ROWS', '1000'))              # rows per DB insert page
 IS_UTXO = bool(int(os.getenv('IS_UTXO', '0')))                      # whether indexing UTXOs (True) or TXOs (False)
 
 # ========================
@@ -127,7 +125,7 @@ def rpc_batch_call(rpc_requests):
         resp = requests.post(RPC_URL, auth=(RPC_USER, RPC_PASSWORD),
                              headers={"content-type": "text/plain"},
                              data=json.dumps(payload),
-                             timeout=60)
+                             timeout=120)
         resp.raise_for_status()
         results = resp.json()
     except requests.exceptions.ConnectionError as e:
@@ -204,64 +202,44 @@ def address_from_vout(v):
 # ========================
 # DB
 # ========================
-def _format_row_fast(row):
-    """Fast row formatting for COPY - optimized for Bitcoin data (no tabs/newlines expected)."""
-    # For Bitcoin data, we rarely have special chars, so optimize the common case
-    parts = []
-    for val in row:
-        if val is None:
-            parts.append('\\N')
-        else:
-            # Most Bitcoin data (txid, address, hex) doesn't need escaping
-            # Only escape if we detect special characters (rare case)
-            s = str(val)
-            if '\\' in s or '\t' in s or '\n' in s or '\r' in s:
-                s = s.replace('\\', '\\\\').replace('\t', '\\t').replace('\n', '\\n').replace('\r', '\\r')
-            parts.append(s)
-    return '\t'.join(parts)
-
 def bulk_insert_utxos_copy(cur, utxo_rows):
     """
-    Insert UTXOs using COPY FROM directly to main table for maximum performance.
-    No temp table overhead - COPY directly to utxos table.
+    Insert UTXOs into the main table using execute_values.
     """
     if not utxo_rows:
         return
     
-    # Prepare data as StringIO for COPY - optimized formatting
-    # Use list comprehension and join for better performance
-    data_lines = [_format_row_fast(row) for row in utxo_rows]
-    data_stream = io.StringIO('\n'.join(data_lines))
-    data_stream.seek(0)
-    
-    # COPY directly to main table - no temp table overhead
-    cur.copy_from(
-        data_stream,
-        'utxos',
-        columns=('txid', 'vout', 'address', 'value_sat', 'script_pub_key_hex', 
-                 'script_pub_type', 'created_block', 'created_block_timestamp'),
-        null='\\N',
-        sep='\t'
-    )
+    insert_sql = """
+        INSERT INTO utxos (
+            txid,
+            vout,
+            address,
+            value_sat,
+            script_pub_key_hex,
+            script_pub_type,
+            created_block,
+            created_block_timestamp
+        )
+        VALUES %s
+    """
+
+    execute_values(cur, insert_sql, utxo_rows, page_size=DB_PAGE_ROWS)
 
 def bulk_insert_block_log_copy(cur, block_rows):
-    """Insert block_log entries using COPY FROM directly to main table."""
+    """Insert block_log entries using execute_values."""
     if not block_rows:
         return
     
-    # Prepare data as StringIO for COPY - optimized
-    data_lines = [_format_row_fast(row) for row in block_rows]
-    data_stream = io.StringIO('\n'.join(data_lines))
-    data_stream.seek(0)
-    
-    # COPY directly to main table
-    cur.copy_from(
-        data_stream,
-        'block_log',
-        columns=('block_height', 'block_hash', 'block_timestamp'),
-        null='\\N',
-        sep='\t'
-    )
+    insert_sql = """
+        INSERT INTO block_log (
+            block_height,
+            block_hash,
+            block_timestamp
+        )
+        VALUES %s
+    """
+
+    execute_values(cur, insert_sql, block_rows, page_size=DB_PAGE_ROWS)
 
 def schema_init():
     import os
@@ -471,10 +449,8 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
             # Build block fetch requests for successful hashes
             block_batch_requests = []
             height_to_hash = {}
-            # Limit batch of blocks to avoid overloading bitcoind memory
-            limited_heights = to_process[:MAX_RPC_BATCH]
-            remaining_heights = to_process[MAX_RPC_BATCH:]
-            for height in limited_heights:
+            # Process all queued heights in this iteration
+            for height in to_process:
                 if height in hash_results:
                     result = hash_results[height]
                     if isinstance(result, dict) and "error" in result:
@@ -507,7 +483,7 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                     continue
                 
                 # Process all fetched blocks
-                for height in limited_heights:
+                for height in to_process:
                     if height in failed_blocks:
                         continue
                     if height not in block_results:
@@ -544,8 +520,8 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
             
             if failed_blocks:
                 print(f"Retrying {len(failed_blocks)} failed blocks in chunk {chunk_start}–{chunk_end} (attempt {retries+2}/{MAX_RETRIES})...")
-            # Re-queue failed first, then remaining heights of this chunk
-            to_process = failed_blocks[:] + remaining_heights[:]
+            # Re-queue failed heights for the next retry
+            to_process = failed_blocks[:]
             retries += 1
             if shutdown_requested:
                 break
@@ -567,16 +543,11 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                 if shutdown_requested:
                     print(f"Shutdown requested before writing chunk {chunk_start}-{chunk_end} to database")
                     break
-                # Speed up bulk load with performance settings
-                cur.execute("SET LOCAL synchronous_commit = OFF")
-                cur.execute("SET LOCAL statement_timeout = 0")
-                cur.execute("SET LOCAL maintenance_work_mem = '256MB'")
-                cur.execute("SET LOCAL work_mem = '64MB'")
                     
                 if out_lists['vout_rows']:
                     vout_start = time.time()
                     vout_count = len(out_lists['vout_rows'])
-                    print(f"[Chunk {chunk_start}-{chunk_end}] Inserting {vout_count} UTXOs using COPY...")
+                    print(f"[Chunk {chunk_start}-{chunk_end}] Inserting {vout_count} UTXOs ...")
                     # Use COPY FROM for fastest bulk inserts
                     bulk_insert_utxos_copy(cur, out_lists['vout_rows'])
                     vout_time = time.time() - vout_start
@@ -603,6 +574,7 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
         except Exception as e:
             print(f"Error writing chunk {chunk_start}-{chunk_end} to PostgreSQL: {e}")
         print(f"Saved and flushed chunk {chunk_start}–{chunk_end}")
+
 
 def get_script_type(script_hex: str, address: str) -> str:
     """
@@ -815,7 +787,7 @@ def main():
             print("UTXO mode enabled - skipping historical block processing")
             read_utxo()
 
-        elif start <= tip:
+        if start <= tip:
             print(f"Catching up: processing blocks {start} → {tip}")
             process_range(start, tip)
         
@@ -824,7 +796,8 @@ def main():
 
         # Recreate address index if missing
         with db.get_db_cursor() as cur:
-            cur.execute("CREATE INDEX IF NOT EXISTS utxos_address_idx ON utxos (address)")
+            cur.execute("CREATE INDEX IF NOT EXISTS utxos_address_idx ON utxos (address);")
+            cur.connection.commit()
         
         while not shutdown_requested:
             try:
