@@ -98,58 +98,93 @@ def rpc_call(method, params=None):
     except requests.exceptions.Timeout as e:
         raise TimeoutError(f"RPC request to {RPC_URL} timed out. Error: {e}")
 
-def rpc_batch_call(rpc_requests):
+class RPCBatchError(RuntimeError):
+    def __init__(self, message, pending=None, last_error=None):
+        super().__init__(message)
+        self.pending = pending or []
+        self.last_error = last_error
+
+
+def rpc_batch_call(rpc_requests, description="RPC batch request"):
     """
-    Send multiple RPC requests in a single batch call using Bitcoin Core's native batching.
-    Bitcoin Core supports JSON-RPC batch requests by sending an array of request objects.
-    rpc_requests: list of tuples (method, params, height)
-    Returns: dict mapping height to result (or {"error": ...} for errors)
+    Send multiple RPC requests with internal retry handling.
+    rpc_requests: list of tuples (method, params, identifier)
+    Returns: dict mapping identifier to result.
+    Raises RPCBatchError if requests cannot be fulfilled within MAX_RETRIES.
     """
     if not rpc_requests:
         return {}
-    
-    payload = []
-    id_to_height = {}
-    for idx, (method, params, height) in enumerate(rpc_requests):
-        request_id = f"batch-{height}-{idx}"
-        id_to_height[request_id] = height
-        # Bitcoin Core accepts batch requests with jsonrpc 1.0 or 2.0
-        payload.append({
-            "jsonrpc": "1.0",
-            "id": request_id,
-            "method": method,
-            "params": params or []
-        })
-    
-    try:
-        resp = requests.post(RPC_URL, auth=(RPC_USER, RPC_PASSWORD),
-                             headers={"content-type": "text/plain"},
-                             data=json.dumps(payload),
-                             timeout=120)
-        resp.raise_for_status()
-        results = resp.json()
-    except requests.exceptions.ConnectionError as e:
-        raise ConnectionError(f"Cannot connect to Bitcoin RPC at {RPC_URL}. "
-                            f"Is Bitcoin Core running? Error: {e}")
-    except requests.exceptions.Timeout as e:
-        raise TimeoutError(f"RPC batch request to {RPC_URL} timed out. Error: {e}")
-    
-    # Handle both single response (if only one request) and array response
-    if not isinstance(results, list):
-        results = [results]
-    
-    # Map results back to heights, handling errors
-    result_map = {}
-    for r in results:
-        request_id = r.get("id", "")
-        if r.get("error"):
-            height = id_to_height.get(request_id, "unknown")
-            result_map[height] = {"error": r["error"]}
+
+    pending = list(rpc_requests)
+    results = {}
+    attempts = 0
+    last_error = None
+
+    while pending and attempts < MAX_RETRIES and not shutdown_requested:
+        payload = []
+        id_to_index = {}
+
+        for idx, (method, params, identifier) in enumerate(pending):
+            request_id = f"batch-{method}-{identifier}-{attempts}-{idx}"
+            id_to_index[request_id] = idx
+            payload.append({
+                "jsonrpc": "1.0",
+                "id": request_id,
+                "method": method,
+                "params": params or []
+            })
+
+        try:
+            resp = requests.post(
+                RPC_URL,
+                auth=(RPC_USER, RPC_PASSWORD),
+                headers={"content-type": "text/plain"},
+                data=json.dumps(payload),
+                timeout=120
+            )
+            resp.raise_for_status()
+            response_payload = resp.json()
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.HTTPError) as e:
+            last_error = e
+        except Exception as e:
+            last_error = e
         else:
-            height = id_to_height.get(request_id, "unknown")
-            result_map[height] = r.get("result")
-    
-    return result_map
+            responses = response_payload if isinstance(response_payload, list) else [response_payload]
+            for entry in responses:
+                request_id = entry.get("id")
+                if request_id not in id_to_index:
+                    continue
+                original_idx = id_to_index[request_id]
+                _, _, identifier = pending[original_idx]
+                if entry.get("error"):
+                    last_error = entry["error"]
+                    continue
+                results[identifier] = entry.get("result")
+
+        pending = [req for req in pending if req[2] not in results]
+
+        if pending and not shutdown_requested:
+            attempts += 1
+            if attempts < MAX_RETRIES:
+                pending_identifiers = [req[2] for req in pending]
+                print(f"Retrying {len(pending)} requests for {description} "
+                      f"(attempt {attempts + 1}/{MAX_RETRIES}); pending identifiers: {pending_identifiers}")
+                time.sleep(RECONNECT_DELAY)
+
+    if shutdown_requested:
+        raise RPCBatchError(f"{description} interrupted by shutdown request.", last_error="shutdown")
+
+    if pending:
+        pending_identifiers = [req[2] for req in pending]
+        raise RPCBatchError(
+            f"{description} failed after {MAX_RETRIES} retries; pending identifiers: {pending_identifiers}",
+            pending=pending_identifiers,
+            last_error=last_error
+        )
+
+    return results
 
 # ========================
 # Utils
@@ -418,119 +453,49 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
         chunk_end = min(chunk_start + chunk_size - 1, end_height)
         print(f"Processing chunk {chunk_start} → {chunk_end}")
 
-        out_lists = { 'vout_rows': [], 'scanned': [] }
-        to_process = list(range(chunk_start, chunk_end + 1))
-        failed_blocks = []
-        retries = 0
-        
+        out_lists = {'vout_rows': [], 'scanned': []}
+        chunk_heights = list(range(chunk_start, chunk_end + 1))
+
+        if not chunk_heights:
+            continue
+
         fetch_start = time.time()
-        while to_process and retries < MAX_RETRIES and not shutdown_requested:
-            failed_blocks.clear()
-            
-            # Batch fetch all block hashes
-            hash_batch_requests = [("getblockhash", [height], height) for height in to_process]
-            try:
-                hash_results = rpc_batch_call(hash_batch_requests)
-            except (ConnectionError, TimeoutError) as e:
-                print(f"Error in batch getblockhash call: {e}")
-                print(f"Waiting {RECONNECT_DELAY} seconds before retry...")
-                time.sleep(RECONNECT_DELAY)
-                failed_blocks = to_process[:]
-                to_process = failed_blocks[:]
-                retries += 1
-                continue
-            except Exception as e:
-                print(f"Error in batch getblockhash call: {e}")
-                failed_blocks = to_process[:]
-                to_process = failed_blocks[:]
-                retries += 1
-                continue
-            
-            # Build block fetch requests for successful hashes
-            block_batch_requests = []
-            height_to_hash = {}
-            # Process all queued heights in this iteration
-            for height in to_process:
-                if height in hash_results:
-                    result = hash_results[height]
-                    if isinstance(result, dict) and "error" in result:
-                        failed_blocks.append(height)
-                        continue
-                    blockhash = result
-                    if blockhash:
-                        height_to_hash[height] = blockhash
-                        block_batch_requests.append(("getblock", [blockhash, 3], height))
-                else:
-                    failed_blocks.append(height)
-            
-            # Batch fetch all blocks
-            if block_batch_requests:
-                try:
-                    block_results = rpc_batch_call(block_batch_requests)
-                except (ConnectionError, TimeoutError) as e:
-                    print(f"Error in batch getblock call: {e}")
-                    print(f"Waiting {RECONNECT_DELAY} seconds before retry...")
-                    time.sleep(RECONNECT_DELAY)
-                    failed_blocks.extend([h for h in to_process if h not in failed_blocks])
-                    to_process = failed_blocks[:]
-                    retries += 1
-                    continue
-                except Exception as e:
-                    print(f"Error in batch getblock call: {e}")
-                    failed_blocks.extend([h for h in to_process if h not in failed_blocks])
-                    to_process = failed_blocks[:]
-                    retries += 1
-                    continue
-                
-                # Process all fetched blocks
-                for height in to_process:
-                    if height in failed_blocks:
-                        continue
-                    if height not in block_results:
-                        failed_blocks.append(height)
-                        continue
-                    
-                    result = block_results[height]
-                    if isinstance(result, dict) and "error" in result:
-                        failed_blocks.append(height)
-                        continue
-                    
-                    blockhash = height_to_hash.get(height, "")
-                    block = result
-                    if not block:
-                        failed_blocks.append(height)
-                        continue
-                    
-                    try:
-                        block_data = process_block_data(block, height, blockhash)
-                        if shutdown_requested:
-                            print(f"Shutdown requested while processing chunk {chunk_start}-{chunk_end}, stopping block accumulation")
-                            failed_blocks.clear()
-                            to_process.clear()
-                            break
-                        out_lists['vout_rows'].extend(block_data['vout_rows'])
-                        if block_data['block_info']:
-                            out_lists['scanned'].append(block_data['block_info'])
-                    except Exception as e:
-                        print(f"Error processing block {height}: {e}")
-                        failed_blocks.append(height)
-            else:
-                # All blocks failed at hash stage
-                pass
-            
-            if failed_blocks:
-                print(f"Retrying {len(failed_blocks)} failed blocks in chunk {chunk_start}–{chunk_end} (attempt {retries+2}/{MAX_RETRIES})...")
-            # Re-queue failed heights for the next retry
-            to_process = failed_blocks[:]
-            retries += 1
+
+        try:
+            hash_batch_requests = [("getblockhash", [height], height) for height in chunk_heights]
+            hash_results = rpc_batch_call(hash_batch_requests, description=f"getblockhash {chunk_start}-{chunk_end}")
+
+            block_batch_requests = [("getblock", [hash_results[height], 3], height) for height in chunk_heights]
+            block_results = rpc_batch_call(block_batch_requests, description=f"getblock {chunk_start}-{chunk_end}")
+        except RPCBatchError as e:
+            print(f"Fatal RPC failure while fetching chunk {chunk_start}-{chunk_end}: {e}")
+            raise
+
+        for height in chunk_heights:
             if shutdown_requested:
+                print(f"Shutdown requested while processing chunk {chunk_start}-{chunk_end}, stopping block accumulation")
                 break
-        
+
+            blockhash = hash_results.get(height)
+            block = block_results.get(height)
+
+            if blockhash is None or block is None:
+                raise RPCBatchError(f"Missing RPC data for block {height}", pending=[height], last_error="missing data")
+
+            try:
+                block_data = process_block_data(block, height, blockhash)
+            except Exception as e:
+                raise RuntimeError(f"Failed to process block {height}: {e}") from e
+
+            out_lists['vout_rows'].extend(block_data['vout_rows'])
+            if block_data['block_info']:
+                out_lists['scanned'].append(block_data['block_info'])
+
+        if shutdown_requested:
+            break
+
         fetch_time = time.time() - fetch_start
-        if to_process:
-            print(f"Failed to process blocks after {MAX_RETRIES} retries in chunk {chunk_start}–{chunk_end}: {to_process}")
-        else:
-            print(f"[Chunk {chunk_start}-{chunk_end}] Fetched {chunk_end - chunk_start + 1} blocks in {fetch_time:.3f}s")
+        print(f"[Chunk {chunk_start}-{chunk_end}] Fetched {chunk_end - chunk_start + 1} blocks in {fetch_time:.3f}s")
 
         if shutdown_requested:
             print(f"Skipping database write for chunk {chunk_start}-{chunk_end} due to shutdown request")
@@ -556,10 +521,6 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                         print(f"[Chunk {chunk_start}-{chunk_end}] Inserted {vout_count} UTXOs in {vout_time:.3f}s ({rows_per_sec:.0f} rows/sec)")
                         if rows_per_sec < 5000:
                             print(f"  Warning: Insert speed is low. Consider setting DROP_ADDRESS_INDEX=true or checking database configuration.")
-                    
-                    if shutdown_requested:
-                        print(f"Shutdown requested after UTXO insert for chunk {chunk_start}-{chunk_end}")
-                        break
 
                 if out_lists['scanned']:
                     block_log_start = time.time()
@@ -569,6 +530,7 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                     bulk_insert_block_log_copy(cur, block_vals)
                     block_log_time = time.time() - block_log_start
                     print(f"[Chunk {chunk_start}-{chunk_end}] Inserted {block_count} block_log entries in {block_log_time:.3f}s")
+
             db_time = time.time() - db_start
             print(f"[Chunk {chunk_start}-{chunk_end}] Database write completed in {db_time:.3f}s")
         except Exception as e:
