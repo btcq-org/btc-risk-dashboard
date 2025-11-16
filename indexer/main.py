@@ -87,7 +87,7 @@ def rpc_call(method, params=None):
         resp = requests.post(RPC_URL, auth=(RPC_USER, RPC_PASSWORD),
                              headers={"content-type": "text/plain"},
                              data=payload,
-                             timeout=30)
+                             timeout=120)
         resp.raise_for_status()
         r = resp.json()
         if r.get("error"):
@@ -187,9 +187,6 @@ def rpc_batch_call(rpc_requests, description="RPC batch request"):
 
     return results
 
-# ========================
-# Utils
-# =======================
 # ========================
 # DB
 # ========================
