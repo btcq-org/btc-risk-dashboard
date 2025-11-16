@@ -38,7 +38,7 @@ RECONNECT_DELAY = 5.0                     # seconds to wait after connection err
 CHUNK_SIZE = int(os.getenv('CHUNK_SIZE', '10'))                    # blocks per catch-up chunk
 MAX_RETRIES = int(os.getenv('MAX_RETRIES', '5'))                    # max retries for failed RPC
 DB_PAGE_ROWS = int(os.getenv('DB_PAGE_ROWS', '1000'))              # rows per DB insert page
-IS_UTXO = bool(int(os.getenv('IS_UTXO', '1')))                      # whether indexing UTXOs (True) or TXOs (False)
+IS_UTXO = bool(int(os.getenv('IS_UTXO', '0')))                      # whether indexing UTXOs (True) or TXOs (False)
 
 # ========================
 # RPC UTILS
@@ -674,8 +674,7 @@ def main():
         if IS_UTXO:
             print("UTXO mode enabled - skipping historical block processing")
             read_utxo(height=923867)
-
-        return
+            return
 
         if start <= tip:
             print(f"Catching up: processing blocks {start} → {tip}")
