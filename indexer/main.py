@@ -35,7 +35,7 @@ POLL_INTERVAL = 1.0                       # seconds between checking for new blo
 RECONNECT_DELAY = 5.0                     # seconds to wait after connection error
 
 # Tuning knobs (can be overridden by env)
-CHUNK_SIZE = int(os.getenv('CHUNK_SIZE', '10'))                    # blocks per catch-up chunk
+CHUNK_SIZE = int(os.getenv('CHUNK_SIZE', '2'))                    # blocks per catch-up chunk
 MAX_RETRIES = int(os.getenv('MAX_RETRIES', '5'))                    # max retries for failed RPC
 DB_PAGE_ROWS = int(os.getenv('DB_PAGE_ROWS', '1000'))              # rows per DB insert page
 IS_UTXO = bool(int(os.getenv('IS_UTXO', '0')))                      # whether indexing UTXOs (True) or TXOs (False)
@@ -229,6 +229,28 @@ def bulk_insert_block_log_copy(cur, block_rows):
 
     execute_values(cur, insert_sql, block_rows, page_size=DB_PAGE_ROWS)
 
+def bulk_update_utxo_spends(cur, spend_rows):
+    """
+    Update UTXOs with spend information.
+    spend_rows: list of tuples (spent_by_txid, spent_vin, spent_block, spent_block_timestamp, txid, vout)
+    """
+    if not spend_rows:
+        return
+    
+    update_sql = """
+        UPDATE utxos
+        SET 
+            spent = TRUE,
+            spent_by_txid = data.spent_by_txid,
+            spent_vin = data.spent_vin,
+            spent_block = data.spent_block,
+            spent_block_timestamp = data.spent_block_timestamp
+        FROM (VALUES %s) AS data(spent_by_txid, spent_vin, spent_block, spent_block_timestamp, txid, vout)
+        WHERE utxos.txid = data.txid AND utxos.vout = data.vout
+    """
+    
+    execute_values(cur, update_sql, spend_rows, page_size=DB_PAGE_ROWS)
+
 def prepare_stats_batch(total_utxo: int, type_counts: Dict[str, int]) -> List[tuple]:
     """
     Prepare stats records for insertion/upsert.
@@ -333,6 +355,7 @@ def process_single_block(height):
     block_ts = int(block_time * 1_000_000_000)
     
     vout_rows = []
+    spend_rows = []
     type_counts: Dict[str, int] = defaultdict(int)
     total_utxo = 0
     
@@ -341,6 +364,29 @@ def process_single_block(height):
         if shutdown_requested:
             print(f"Shutdown requested while scanning transactions for block {height}")
             return False
+        
+        # Process vins (transaction inputs) to mark UTXOs as spent
+        for vin_idx, vin in enumerate(tx.get("vin", [])):
+            # Skip coinbase transactions (they don't have valid txid/vout references)
+            if "coinbase" in vin:
+                continue
+            
+            # Extract the UTXO being spent
+            spent_txid = vin.get("txid")
+            spent_vout = vin.get("vout")
+            
+            # Only process if we have valid references
+            if spent_txid and spent_vout is not None:
+                spend_rows.append((
+                    txid,  # spent_by_txid
+                    vin_idx,  # spent_vin
+                    height,  # spent_block
+                    block_ts,  # spent_block_timestamp
+                    spent_txid,  # txid (the UTXO being spent)
+                    spent_vout  # vout (the UTXO being spent)
+                ))
+        
+        # Process vouts (transaction outputs) to create new UTXOs
         for idx, v in enumerate(tx.get("vout", [])):
             spk = v.get("scriptPubKey", {})
             address = address_from_vout(v)
@@ -380,6 +426,17 @@ def process_single_block(height):
                     rows_per_sec = vout_count / vout_time
                     print(f"[Block {height}] Inserted {vout_count} UTXOs in {vout_time:.3f}s ({rows_per_sec:.0f} rows/sec)")
             
+            # Update UTXOs with spend information
+            if spend_rows:
+                spend_start = time.time()
+                spend_count = len(spend_rows)
+                print(f"[Block {height}] Updating {spend_count} UTXO spends...")
+                bulk_update_utxo_spends(cur, spend_rows)
+                spend_time = time.time() - spend_start
+                if spend_time > 0:
+                    rows_per_sec = spend_count / spend_time
+                    print(f"[Block {height}] Updated {spend_count} UTXO spends in {spend_time:.3f}s ({rows_per_sec:.0f} rows/sec)")
+            
             # Insert block log entry
             bulk_insert_block_log_copy(cur, [(height, blockhash, block_ts)])
             stats_batch = prepare_stats_batch(total_utxo, dict(type_counts))
@@ -399,11 +456,12 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
     print(f"Processing blocks {start_height} → {end_height} in chunks of {chunk_size}")
 
     def process_block_data(block, height, blockhash):
-        """Process a single block's data and extract VOUTs (UTXOs)."""
+        """Process a single block's data and extract VOUTs (UTXOs) and VINs (spends)."""
         block_time = block.get('time', 0)
         block_ts = int(block_time * 1_000_000_000)
 
         vout_rows = []
+        spend_rows = []
         type_counts: Dict[str, int] = defaultdict(int)
         total_utxo = 0
 
@@ -413,8 +471,32 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                 print(f"Shutdown requested while preparing chunk data for block {height}")
                 return {
                     'vout_rows': [],
+                    'spend_rows': [],
                     'block_info': None
                 }
+            
+            # Process vins (transaction inputs) to mark UTXOs as spent
+            for vin_idx, vin in enumerate(tx.get("vin", [])):
+                # Skip coinbase transactions (they don't have valid txid/vout references)
+                if "coinbase" in vin:
+                    continue
+                
+                # Extract the UTXO being spent
+                spent_txid = vin.get("txid")
+                spent_vout = vin.get("vout")
+                
+                # Only process if we have valid references
+                if spent_txid and spent_vout is not None:
+                    spend_rows.append((
+                        txid,  # spent_by_txid
+                        vin_idx,  # spent_vin
+                        height,  # spent_block
+                        block_ts,  # spent_block_timestamp
+                        spent_txid,  # txid (the UTXO being spent)
+                        spent_vout  # vout (the UTXO being spent)
+                    ))
+            
+            # Process vouts (transaction outputs) to create new UTXOs
             for idx, v in enumerate(tx.get("vout", [])):
                 spk = v.get("scriptPubKey", {})
                 address = address_from_vout(v)
@@ -436,6 +518,7 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
 
         return {
             'vout_rows': vout_rows,
+            'spend_rows': spend_rows,
             'block_info': {
                 "block_height": height,
                 "block_hash": blockhash,
@@ -455,7 +538,7 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
         chunk_end = min(chunk_start + chunk_size - 1, end_height)
         print(f"Processing chunk {chunk_start} → {chunk_end}")
 
-        out_lists = {'vout_rows': [], 'scanned': []}
+        out_lists = {'vout_rows': [], 'spend_rows': [], 'scanned': []}
         chunk_heights = list(range(chunk_start, chunk_end + 1))
         chunk_type_counts: Dict[str, int] = defaultdict(int)
         chunk_total_utxo = 0
@@ -492,6 +575,7 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                 raise RuntimeError(f"Failed to process block {height}: {e}") from e
 
             out_lists['vout_rows'].extend(block_data['vout_rows'])
+            out_lists['spend_rows'].extend(block_data.get('spend_rows', []))
             if block_data['block_info']:
                 out_lists['scanned'].append(block_data['block_info'])
             block_stats = block_data.get('stats', {})
@@ -526,6 +610,17 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                     if vout_time > 0:
                         rows_per_sec = vout_count / vout_time
                         print(f"[Chunk {chunk_start}-{chunk_end}] Inserted {vout_count} UTXOs in {vout_time:.3f}s ({rows_per_sec:.0f} rows/sec)")
+
+                # Update UTXOs with spend information
+                if out_lists['spend_rows']:
+                    spend_start = time.time()
+                    spend_count = len(out_lists['spend_rows'])
+                    print(f"[Chunk {chunk_start}-{chunk_end}] Updating {spend_count} UTXO spends...")
+                    bulk_update_utxo_spends(cur, out_lists['spend_rows'])
+                    spend_time = time.time() - spend_start
+                    if spend_time > 0:
+                        rows_per_sec = spend_count / spend_time
+                        print(f"[Chunk {chunk_start}-{chunk_end}] Updated {spend_count} UTXO spends in {spend_time:.3f}s ({rows_per_sec:.0f} rows/sec)")
 
                 if out_lists['scanned']:
                     block_log_start = time.time()
