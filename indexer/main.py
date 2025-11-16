@@ -38,7 +38,7 @@ RECONNECT_DELAY = 5.0                     # seconds to wait after connection err
 CHUNK_SIZE = int(os.getenv('CHUNK_SIZE', '10'))                    # blocks per catch-up chunk
 MAX_RETRIES = int(os.getenv('MAX_RETRIES', '5'))                    # max retries for failed RPC
 DB_PAGE_ROWS = int(os.getenv('DB_PAGE_ROWS', '1000'))              # rows per DB insert page
-IS_UTXO = bool(int(os.getenv('IS_UTXO', '0')))                      # whether indexing UTXOs (True) or TXOs (False)
+IS_UTXO = bool(int(os.getenv('IS_UTXO', '1')))                      # whether indexing UTXOs (True) or TXOs (False)
 
 # ========================
 # RPC UTILS
@@ -563,6 +563,7 @@ def read_utxo(height: int = 840_000,batch_size: int = 1_000_000):
 
     with open('./data/utxo.csv', 'r') as f:
         reader = csv.reader(f, delimiter=',')
+        read_start = time.time()
         for line_num, fields in enumerate(reader, start=1):
             if len(fields) != 6:
                 print(f"Warning: Skipping malformed line {line_num} (expected 6 fields, got {len(fields)})", file=sys.stderr)
@@ -579,7 +580,6 @@ def read_utxo(height: int = 840_000,batch_size: int = 1_000_000):
                 address = fields[5].strip()
                 script_type = get_script_type(script_pub_key, address)
                 type_counts[script_type] += 1
-                total_utxo += 1
 
                 if address == '':
                     continue
@@ -590,15 +590,23 @@ def read_utxo(height: int = 840_000,batch_size: int = 1_000_000):
                 )
                 
                 batch.append(row_tuple)
+                total_utxo += 1
 
                 if len(batch) >= batch_size:
+                    print(f"Reading batch of {len(batch)} rows..., Read CSV batch in {time.time() - read_start}s", file=sys.stderr)
+                    if shutdown_requested:
+                        print(f"Shutdown requested, stopping UTXO import", file=sys.stderr)
+                        break
                     print(f"Inserting batch of {len(batch)} rows...", file=sys.stderr)
-                    start = time.time()
+                    insert_start = time.time()
                     with db.get_db_cursor() as cur:
                             execute_values(cur, insert_sql, batch, page_size=1000)
                             cur.connection.commit()
-                    print(f"Inserted batch: {total_utxo} total rows", file=sys.stderr)
+                    insert_time = time.time() - insert_start
+                    rows_per_sec = len(batch) / insert_time
+                    print(f"Inserted batch of {len(batch)} rows in {insert_time:.3f}s ({rows_per_sec:.0f} rows/sec). Total rows: {total_utxo}", file=sys.stderr)
                     batch = []
+                    read_start = time.time()
             
             except (ValueError, IndexError) as e:
                 print(f"Warning: Skipping line {line_num} due to parse error: {e}", file=sys.stderr)
@@ -606,18 +614,29 @@ def read_utxo(height: int = 840_000,batch_size: int = 1_000_000):
 
     stats_batch = prepare_stats_batch(total_utxo, dict(type_counts))
 
-    start = time.time()
+    final_insert_start = time.time()
     print(f"Inserting final batch of {len(batch)} rows...", file=sys.stderr)
     with db.get_db_cursor() as cur:
         if len(batch) > 0:
+            final_batch_start = time.time()
             execute_values(cur, insert_sql, batch, page_size=1000)
         upsert_stats(cur, stats_batch, absolute=True)
+        final_batch_time = time.time() - final_batch_start
+        if final_batch_time > 0:
+            rows_per_sec = len(batch) / final_batch_time
+            print(f"Inserted final batch of {len(batch)} rows in {final_batch_time:.3f}s ({rows_per_sec:.0f} rows/sec)", file=sys.stderr)
+
+        index_start = time.time()
         cur.execute("ALTER TABLE utxos ADD PRIMARY KEY (txid, vout);")
         cur.execute("CREATE INDEX IF NOT EXISTS utxos_address_idx ON utxos (address);")
-        cur.execute("INSERT INTO block_log (block_height, block_hash, block_timestamp) VALUES (0, '0'*64, 0) ON CONFLICT DO NOTHING;")
+        cur.execute("INSERT INTO block_log (block_height, block_hash, block_timestamp) VALUES (%s, %s, 0) ON CONFLICT DO NOTHING;", (height, '0' * 64))
+        index_time = time.time() - index_start
+        print(f"Created indexes and updated block_log in {index_time:.3f}s", file=sys.stderr)
+        
         cur.connection.commit()
-        print(f"Inserted stats and created indexes in {time.time() - start}", file=sys.stderr)
-    
+
+    final_insert_time = time.time() - final_insert_start
+    print(f"Final batch insertion complete in {final_insert_time:.3f}s. ", file=sys.stderr)
     print(f"UTXO import complete. Total rows inserted: {total_utxo}", file=sys.stderr)
 
     return
@@ -654,7 +673,9 @@ def main():
 
         if IS_UTXO:
             print("UTXO mode enabled - skipping historical block processing")
-            read_utxo()
+            read_utxo(height=923867)
+
+        return
 
         if start <= tip:
             print(f"Catching up: processing blocks {start} → {tip}")
