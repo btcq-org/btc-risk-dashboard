@@ -35,7 +35,7 @@ POLL_INTERVAL = 1.0                       # seconds between checking for new blo
 RECONNECT_DELAY = 5.0                     # seconds to wait after connection error
 
 # Tuning knobs (can be overridden by env)
-CHUNK_SIZE = int(os.getenv('CHUNK_SIZE', '2'))                    # blocks per catch-up chunk
+CHUNK_SIZE = int(os.getenv('CHUNK_SIZE', '10'))                    # blocks per catch-up chunk
 MAX_RETRIES = int(os.getenv('MAX_RETRIES', '5'))                    # max retries for failed RPC
 DB_PAGE_ROWS = int(os.getenv('DB_PAGE_ROWS', '1000'))              # rows per DB insert page
 IS_UTXO = bool(int(os.getenv('IS_UTXO', '0')))                      # whether indexing UTXOs (True) or TXOs (False)
@@ -722,7 +722,19 @@ def read_utxo(height: int = 840_000,batch_size: int = 1_000_000):
             print(f"Inserted final batch of {len(batch)} rows in {final_batch_time:.3f}s ({rows_per_sec:.0f} rows/sec)", file=sys.stderr)
 
         index_start = time.time()
-        cur.execute("ALTER TABLE utxos ADD PRIMARY KEY (txid, vout);")
+        # Check if primary key exists before adding it
+        cur.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint 
+                    WHERE conname = 'utxos_pkey' 
+                    AND conrelid = 'utxos'::regclass
+                ) THEN
+                    ALTER TABLE utxos ADD PRIMARY KEY (txid, vout);
+                END IF;
+            END $$;
+        """)
         cur.execute("CREATE INDEX IF NOT EXISTS utxos_address_idx ON utxos (address);")
         cur.execute("INSERT INTO block_log (block_height, block_hash, block_timestamp) VALUES (%s, %s, 0) ON CONFLICT DO NOTHING;", (height, '0' * 64))
         index_time = time.time() - index_start
@@ -786,7 +798,19 @@ def main():
         # Recreate address index if missing
         with db.get_db_cursor() as cur:
             cur.execute("CREATE INDEX IF NOT EXISTS utxos_address_idx ON utxos (address);")
-            cur.execute("ALTER TABLE utxos ADD PRIMARY KEY (txid, vout);")
+            # Check if primary key exists before adding it
+            cur.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint 
+                        WHERE conname = 'utxos_pkey' 
+                        AND conrelid = 'utxos'::regclass
+                    ) THEN
+                        ALTER TABLE utxos ADD PRIMARY KEY (txid, vout);
+                    END IF;
+                END $$;
+            """)
             cur.connection.commit()
         
         while not shutdown_requested:
