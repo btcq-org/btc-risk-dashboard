@@ -229,27 +229,24 @@ def bulk_insert_block_log_copy(cur, block_rows):
 
     execute_values(cur, insert_sql, block_rows, page_size=DB_PAGE_ROWS)
 
-def bulk_update_utxo_spends(cur, spend_rows):
+def bulk_delete_utxos(cur, spend_rows):
     """
-    Update UTXOs with spend information.
+    Delete UTXOs that have been spent.
     spend_rows: list of tuples (spent_by_txid, spent_vin, spent_block, spent_block_timestamp, txid, vout)
+    Only txid and vout are used for deletion.
     """
     if not spend_rows:
         return
     
-    update_sql = """
-        UPDATE utxos
-        SET 
-            spent = TRUE,
-            spent_by_txid = data.spent_by_txid,
-            spent_vin = data.spent_vin,
-            spent_block = data.spent_block,
-            spent_block_timestamp = data.spent_block_timestamp
-        FROM (VALUES %s) AS data(spent_by_txid, spent_vin, spent_block, spent_block_timestamp, txid, vout)
-        WHERE utxos.txid = data.txid AND utxos.vout = data.vout
+    # Extract only txid and vout for deletion
+    delete_rows = [(txid, vout) for _, _, _, _, txid, vout in spend_rows]
+    
+    delete_sql = """
+        DELETE FROM utxos
+        WHERE (txid, vout) IN (VALUES %s)
     """
     
-    execute_values(cur, update_sql, spend_rows, page_size=DB_PAGE_ROWS)
+    execute_values(cur, delete_sql, delete_rows, page_size=DB_PAGE_ROWS)
 
 def prepare_stats_batch(total_utxo: int, type_counts: Dict[str, int]) -> List[tuple]:
     """
@@ -365,7 +362,7 @@ def process_single_block(height):
             print(f"Shutdown requested while scanning transactions for block {height}")
             return False
         
-        # Process vins (transaction inputs) to mark UTXOs as spent
+        # Process vins (transaction inputs) to identify spent UTXOs for deletion
         for vin_idx, vin in enumerate(tx.get("vin", [])):
             # Skip coinbase transactions (they don't have valid txid/vout references)
             if "coinbase" in vin:
@@ -426,16 +423,16 @@ def process_single_block(height):
                     rows_per_sec = vout_count / vout_time
                     print(f"[Block {height}] Inserted {vout_count} UTXOs in {vout_time:.3f}s ({rows_per_sec:.0f} rows/sec)")
             
-            # Update UTXOs with spend information
+            # Delete UTXOs that have been spent
             if spend_rows:
                 spend_start = time.time()
                 spend_count = len(spend_rows)
-                print(f"[Block {height}] Updating {spend_count} UTXO spends...")
-                bulk_update_utxo_spends(cur, spend_rows)
+                print(f"[Block {height}] Deleting {spend_count} spent UTXOs...")
+                bulk_delete_utxos(cur, spend_rows)
                 spend_time = time.time() - spend_start
                 if spend_time > 0:
                     rows_per_sec = spend_count / spend_time
-                    print(f"[Block {height}] Updated {spend_count} UTXO spends in {spend_time:.3f}s ({rows_per_sec:.0f} rows/sec)")
+                    print(f"[Block {height}] Deleted {spend_count} spent UTXOs in {spend_time:.3f}s ({rows_per_sec:.0f} rows/sec)")
             
             # Insert block log entry
             bulk_insert_block_log_copy(cur, [(height, blockhash, block_ts)])
@@ -475,7 +472,7 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                     'block_info': None
                 }
             
-            # Process vins (transaction inputs) to mark UTXOs as spent
+            # Process vins (transaction inputs) to identify spent UTXOs for deletion
             for vin_idx, vin in enumerate(tx.get("vin", [])):
                 # Skip coinbase transactions (they don't have valid txid/vout references)
                 if "coinbase" in vin:
@@ -611,16 +608,16 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                         rows_per_sec = vout_count / vout_time
                         print(f"[Chunk {chunk_start}-{chunk_end}] Inserted {vout_count} UTXOs in {vout_time:.3f}s ({rows_per_sec:.0f} rows/sec)")
 
-                # Update UTXOs with spend information
+                # Delete UTXOs that have been spent
                 if out_lists['spend_rows']:
                     spend_start = time.time()
                     spend_count = len(out_lists['spend_rows'])
-                    print(f"[Chunk {chunk_start}-{chunk_end}] Updating {spend_count} UTXO spends...")
-                    bulk_update_utxo_spends(cur, out_lists['spend_rows'])
+                    print(f"[Chunk {chunk_start}-{chunk_end}] Deleting {spend_count} spent UTXOs...")
+                    bulk_delete_utxos(cur, out_lists['spend_rows'])
                     spend_time = time.time() - spend_start
                     if spend_time > 0:
                         rows_per_sec = spend_count / spend_time
-                        print(f"[Chunk {chunk_start}-{chunk_end}] Updated {spend_count} UTXO spends in {spend_time:.3f}s ({rows_per_sec:.0f} rows/sec)")
+                        print(f"[Chunk {chunk_start}-{chunk_end}] Deleted {spend_count} spent UTXOs in {spend_time:.3f}s ({rows_per_sec:.0f} rows/sec)")
 
                 if out_lists['scanned']:
                     block_log_start = time.time()
