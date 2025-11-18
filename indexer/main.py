@@ -231,32 +231,54 @@ def bulk_insert_block_log_copy(cur, block_rows):
 
 def bulk_delete_utxos(cur, spend_rows):
     """
-    Delete UTXOs that have been spent.
+    Delete UTXOs that have been spent and return their values and script types.
     spend_rows: list of tuples (spent_by_txid, spent_vin, spent_block, spent_block_timestamp, txid, vout)
     Only txid and vout are used for deletion.
+    Returns: list of tuples (value_sat, script_pub_type) for deleted UTXOs
     """
     if not spend_rows:
-        return
+        return []
     
     # Extract only txid and vout for deletion
     delete_rows = [(txid, vout) for _, _, _, _, txid, vout in spend_rows]
     
-    delete_sql = """
-        DELETE FROM utxos
-        WHERE (txid, vout) IN (VALUES %s)
-    """
+    # Use DELETE ... RETURNING to get values and script types before deletion
+    # We need to use execute_values pattern but with RETURNING, so we'll do it in batches
+    deleted_utxos = []
     
-    execute_values(cur, delete_sql, delete_rows, page_size=DB_PAGE_ROWS)
+    for page in [delete_rows[i:i+DB_PAGE_ROWS] for i in range(0, len(delete_rows), DB_PAGE_ROWS)]:
+        # Build the VALUES clause manually for this page
+        placeholders = ','.join(['(%s, %s)'] * len(page))
+        delete_sql = f"""
+            DELETE FROM utxos
+            WHERE (txid, vout) IN (VALUES {placeholders})
+            RETURNING value_sat, script_pub_type
+        """
+        # Flatten the page for parameter binding
+        params = [item for pair in page for item in pair]
+        cur.execute(delete_sql, params)
+        deleted_utxos.extend(cur.fetchall())
+    
+    return deleted_utxos
 
-def prepare_stats_batch(total_utxo: int, type_counts: Dict[str, int]) -> List[tuple]:
+def prepare_stats_batch(total_utxo: int, type_counts: Dict[str, int], total_balance_sat: int = 0, type_balances: Dict[str, int] = None) -> List[tuple]:
     """
     Prepare stats records for insertion/upsert.
+    total_utxo: change in UTXO count (positive for additions, negative for deletions)
+    type_counts: dict of script_type -> count change
+    total_balance_sat: change in total balance in satoshis (positive for additions, negative for deletions)
+    type_balances: dict of script_type -> balance change in satoshis
     """
     stats_batch = []
     if total_utxo:
         stats_batch.append(('total_utxo', total_utxo))
+    if total_balance_sat:
+        stats_batch.append(('total_balance_sat', total_balance_sat))
     for script_type, count in type_counts.items():
         stats_batch.append((f"{script_type}_count", count))
+    if type_balances:
+        for script_type, balance in type_balances.items():
+            stats_batch.append((f"{script_type}_balance_sat", balance))
     return stats_batch
 
 def upsert_stats(cur, stats_batch: List[tuple], *, absolute: bool = False):
@@ -280,6 +302,62 @@ def upsert_stats(cur, stats_batch: List[tuple], *, absolute: bool = False):
         """
 
     execute_values(cur, stats_upsert_sql, stats_batch)
+
+def recalculate_stats_from_db(cur):
+    """
+    Recalculate all stats from the current state of the utxos table using SQL.
+    This function directly queries the database and updates the stats table with
+    the current counts and balances.
+    """
+    # Recalculate total UTXO count and total balance
+    cur.execute("""
+        INSERT INTO stats (key, value)
+        SELECT 'total_utxo', COUNT(*)::bigint
+        FROM utxos
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+    """)
+    
+    cur.execute("""
+        INSERT INTO stats (key, value)
+        SELECT 'total_balance_sat', COALESCE(SUM(value_sat), 0)::bigint
+        FROM utxos
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+    """)
+    
+    # Recalculate counts and balances per script type
+    cur.execute("""
+        INSERT INTO stats (key, value)
+        SELECT 
+            script_pub_type || '_count' AS key,
+            COUNT(*)::bigint AS value
+        FROM utxos
+        WHERE script_pub_type IS NOT NULL
+        GROUP BY script_pub_type
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+    """)
+    
+    cur.execute("""
+        INSERT INTO stats (key, value)
+        SELECT 
+            script_pub_type || '_balance_sat' AS key,
+            COALESCE(SUM(value_sat), 0)::bigint AS value
+        FROM utxos
+        WHERE script_pub_type IS NOT NULL
+        GROUP BY script_pub_type
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+    """)
+    
+    # Remove stats for script types that no longer exist in the database
+    cur.execute("""
+        DELETE FROM stats
+        WHERE (key LIKE '%_count' OR key LIKE '%_balance_sat')
+        AND key NOT IN (
+            SELECT script_pub_type || '_count' FROM utxos WHERE script_pub_type IS NOT NULL
+            UNION
+            SELECT script_pub_type || '_balance_sat' FROM utxos WHERE script_pub_type IS NOT NULL
+        )
+        AND key NOT IN ('total_utxo', 'total_balance_sat')
+    """)
 
 def schema_init():
     import os
@@ -354,7 +432,9 @@ def process_single_block(height):
     vout_rows = []
     spend_rows = []
     type_counts: Dict[str, int] = defaultdict(int)
+    type_balances: Dict[str, int] = defaultdict(int)
     total_utxo = 0
+    total_balance_sat = 0
     
     for tx in block.get("tx", []):
         txid = tx.get("txid", "")
@@ -401,7 +481,9 @@ def process_single_block(height):
                 block_ts
             ))
             type_counts[script_type] += 1
+            type_balances[script_type] += value_sat
             total_utxo += 1
+            total_balance_sat += value_sat
     
     try:
         db_start = time.time()
@@ -424,11 +506,20 @@ def process_single_block(height):
                     print(f"[Block {height}] Inserted {vout_count} UTXOs in {vout_time:.3f}s ({rows_per_sec:.0f} rows/sec)")
             
             # Delete UTXOs that have been spent
+            deleted_balance_sat = 0
+            deleted_type_balances: Dict[str, int] = defaultdict(int)
+            deleted_type_counts: Dict[str, int] = defaultdict(int)
+            
             if spend_rows:
                 spend_start = time.time()
                 spend_count = len(spend_rows)
                 print(f"[Block {height}] Deleting {spend_count} spent UTXOs...")
-                bulk_delete_utxos(cur, spend_rows)
+                deleted_utxos = bulk_delete_utxos(cur, spend_rows)
+                # Track balance and counts for deleted UTXOs
+                for value_sat, script_type in deleted_utxos:
+                    deleted_balance_sat += value_sat
+                    deleted_type_balances[script_type] += value_sat
+                    deleted_type_counts[script_type] += 1
                 spend_time = time.time() - spend_start
                 if spend_time > 0:
                     rows_per_sec = spend_count / spend_time
@@ -436,7 +527,17 @@ def process_single_block(height):
             
             # Insert block log entry
             bulk_insert_block_log_copy(cur, [(height, blockhash, block_ts)])
-            stats_batch = prepare_stats_batch(total_utxo, dict(type_counts))
+            
+            # Calculate net changes for stats (additions - deletions)
+            net_total_utxo = total_utxo - sum(deleted_type_counts.values())
+            net_total_balance_sat = total_balance_sat - deleted_balance_sat
+            net_type_counts = {k: type_counts[k] - deleted_type_counts.get(k, 0) for k in set(type_counts.keys()) | set(deleted_type_counts.keys())}
+            net_type_balances = {k: type_balances[k] - deleted_type_balances.get(k, 0) for k in set(type_balances.keys()) | set(deleted_type_balances.keys())}
+            # Remove zero values
+            net_type_counts = {k: v for k, v in net_type_counts.items() if v != 0}
+            net_type_balances = {k: v for k, v in net_type_balances.items() if v != 0}
+            
+            stats_batch = prepare_stats_batch(net_total_utxo, net_type_counts, net_total_balance_sat, net_type_balances)
             upsert_stats(cur, stats_batch)
         db_time = time.time() - db_start
         print(f"[Block {height}] Database write completed in {db_time:.3f}s")
@@ -460,7 +561,9 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
         vout_rows = []
         spend_rows = []
         type_counts: Dict[str, int] = defaultdict(int)
+        type_balances: Dict[str, int] = defaultdict(int)
         total_utxo = 0
+        total_balance_sat = 0
 
         for tx in block.get("tx", []):
             txid = tx.get("txid", "")
@@ -511,7 +614,9 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                     block_ts
                 ))
                 type_counts[script_type] += 1
+                type_balances[script_type] += value_sat
                 total_utxo += 1
+                total_balance_sat += value_sat
 
         return {
             'vout_rows': vout_rows,
@@ -523,7 +628,9 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
             },
             'stats': {
                 'total_utxo': total_utxo,
-                'type_counts': dict(type_counts)
+                'total_balance_sat': total_balance_sat,
+                'type_counts': dict(type_counts),
+                'type_balances': dict(type_balances)
             }
         }
 
@@ -538,7 +645,9 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
         out_lists = {'vout_rows': [], 'spend_rows': [], 'scanned': []}
         chunk_heights = list(range(chunk_start, chunk_end + 1))
         chunk_type_counts: Dict[str, int] = defaultdict(int)
+        chunk_type_balances: Dict[str, int] = defaultdict(int)
         chunk_total_utxo = 0
+        chunk_total_balance_sat = 0
 
         if not chunk_heights:
             continue
@@ -577,8 +686,11 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                 out_lists['scanned'].append(block_data['block_info'])
             block_stats = block_data.get('stats', {})
             chunk_total_utxo += block_stats.get('total_utxo', 0)
+            chunk_total_balance_sat += block_stats.get('total_balance_sat', 0)
             for script_type, count in block_stats.get('type_counts', {}).items():
                 chunk_type_counts[script_type] += count
+            for script_type, balance in block_stats.get('type_balances', {}).items():
+                chunk_type_balances[script_type] += balance
 
         if shutdown_requested:
             break
@@ -609,11 +721,20 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                         print(f"[Chunk {chunk_start}-{chunk_end}] Inserted {vout_count} UTXOs in {vout_time:.3f}s ({rows_per_sec:.0f} rows/sec)")
 
                 # Delete UTXOs that have been spent
+                deleted_balance_sat = 0
+                deleted_type_balances: Dict[str, int] = defaultdict(int)
+                deleted_type_counts: Dict[str, int] = defaultdict(int)
+                
                 if out_lists['spend_rows']:
                     spend_start = time.time()
                     spend_count = len(out_lists['spend_rows'])
                     print(f"[Chunk {chunk_start}-{chunk_end}] Deleting {spend_count} spent UTXOs...")
-                    bulk_delete_utxos(cur, out_lists['spend_rows'])
+                    deleted_utxos = bulk_delete_utxos(cur, out_lists['spend_rows'])
+                    # Track balance and counts for deleted UTXOs
+                    for value_sat, script_type in deleted_utxos:
+                        deleted_balance_sat += value_sat
+                        deleted_type_balances[script_type] += value_sat
+                        deleted_type_counts[script_type] += 1
                     spend_time = time.time() - spend_start
                     if spend_time > 0:
                         rows_per_sec = spend_count / spend_time
@@ -628,7 +749,16 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                     block_log_time = time.time() - block_log_start
                     print(f"[Chunk {chunk_start}-{chunk_end}] Inserted {block_count} block_log entries in {block_log_time:.3f}s")
                 
-                stats_batch = prepare_stats_batch(chunk_total_utxo, dict(chunk_type_counts))
+                # Calculate net changes for stats (additions - deletions)
+                net_total_utxo = chunk_total_utxo - sum(deleted_type_counts.values())
+                net_total_balance_sat = chunk_total_balance_sat - deleted_balance_sat
+                net_type_counts = {k: chunk_type_counts[k] - deleted_type_counts.get(k, 0) for k in set(chunk_type_counts.keys()) | set(deleted_type_counts.keys())}
+                net_type_balances = {k: chunk_type_balances[k] - deleted_type_balances.get(k, 0) for k in set(chunk_type_balances.keys()) | set(deleted_type_balances.keys())}
+                # Remove zero values
+                net_type_counts = {k: v for k, v in net_type_counts.items() if v != 0}
+                net_type_balances = {k: v for k, v in net_type_balances.items() if v != 0}
+                
+                stats_batch = prepare_stats_batch(net_total_utxo, net_type_counts, net_total_balance_sat, net_type_balances)
                 upsert_stats(cur, stats_batch)
 
             db_time = time.time() - db_start
