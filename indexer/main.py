@@ -39,6 +39,7 @@ CHUNK_SIZE = int(os.getenv('CHUNK_SIZE', '10'))                    # blocks per 
 MAX_RETRIES = int(os.getenv('MAX_RETRIES', '5'))                    # max retries for failed RPC
 DB_PAGE_ROWS = int(os.getenv('DB_PAGE_ROWS', '1000'))              # rows per DB insert page
 IS_UTXO = bool(int(os.getenv('IS_UTXO', '0')))                      # whether indexing UTXOs (True) or TXOs (False)
+IS_RECALC = bool(int(os.getenv('IS_RECALC', '0'))) 
 
 # ========================
 # RPC UTILS
@@ -905,12 +906,22 @@ def main():
         
         print(f"Tippity top: {tip} | Starting from: {start}")
 
+        if IS_RECALC:
+            print("Recalculating stats from database...")
+            with db.get_db_cursor() as cur:
+                recalculate_stats_from_db(cur)
+                cur.connection.commit()
+            print("Recalculation complete.")
+            db.shutdown_pool()
+            return
+
         if IS_UTXO:
             print("UTXO mode enabled - skipping historical block processing")
             read_utxo(height=923867)
+            db.shutdown_pool()
             return
 
-        if start <= tip:
+        if start <= tip + 20:
             print(f"Catching up: processing blocks {start} → {tip}")
             process_range(start, tip)
 
