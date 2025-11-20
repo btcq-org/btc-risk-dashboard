@@ -90,6 +90,38 @@ def stats_overview():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/stats/supply")
+def stats_supply():
+    """Return total supply and balance_sat for each script type from the stats table."""
+    try:
+        with db.get_db_cursor(cursor_factory=RealDictCursor) as cur:
+            # Get all stats from stats table
+            cur.execute("SELECT key, value FROM stats")
+            stats_rows = cur.fetchall()
+            
+            # Initialize stats dictionary
+            stats_dict = {}
+            for row in stats_rows:
+                stats_dict[row["key"]] = int(row["value"])
+            
+            # Get total supply (total_balance_sat)
+            total_supply_sat = stats_dict.get("total_balance_sat", 0)
+            
+            # Get all script type balances (keys ending with _balance_sat, excluding total_balance_sat)
+            script_type_balances = {}
+            for key, value in stats_dict.items():
+                if key.endswith("_balance_sat") and key != "total_balance_sat":
+                    # Extract script type by removing "_balance_sat" suffix
+                    script_type = key[:-12]  # Remove "_balance_sat" (13 characters)
+                    script_type_balances[script_type] = value
+            
+            return {
+                "total_supply_sat": total_supply_sat,
+                "script_type_balances": script_type_balances,
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/search")
 def search(q: str = Query(..., min_length=1)):
     results = []
