@@ -239,6 +239,56 @@ def update_address_status_with_vin_balance(cur, deleted_utxos):
         """
         execute_values(cur, sql, rows_to_update)
 
+def update_address_stats_incremental(cur, vout_rows, deleted_utxos):
+    """
+    Update address_stats table based on balance changes from vouts and vins.
+    Recalculates stats for affected script types from address_status table.
+    vout_rows: list of tuples with new UTXOs (includes address, value_sat, script_type)
+    deleted_utxos: list of tuples (address, value_sat, script_pub_type) for deleted UTXOs
+    """
+    # Collect all script types that were affected
+    affected_script_types = set()
+    
+    # Process vouts (additions)
+    for row in vout_rows:
+        script_type = row[5]  # script_pub_type is the 6th field
+        if script_type:
+            affected_script_types.add(script_type)
+    
+    # Process deleted UTXOs (subtractions)
+    for address, value_sat, script_type in deleted_utxos:
+        if script_type:
+            affected_script_types.add(script_type)
+    
+    if not affected_script_types:
+        return
+    
+    # Recalculate address_stats for affected script types from address_status
+    # This ensures accuracy since address_status has been updated with balance changes
+    cur.execute("""
+        INSERT INTO address_stats (
+            script_pub_type,
+            reused_sat,
+            total_sat,
+            reused_count,
+            count
+        )
+        SELECT 
+            script_pub_type,
+            SUM(CASE WHEN reused THEN balance_sat ELSE 0 END) AS reused_sat,
+            SUM(balance_sat) AS total_sat,
+            COUNT(*) FILTER (WHERE reused) AS reused_count,
+            COUNT(*) AS count
+        FROM address_status
+        WHERE script_pub_type IN %s
+        GROUP BY script_pub_type
+        ON CONFLICT (script_pub_type) DO UPDATE SET
+            reused_sat = EXCLUDED.reused_sat,
+            total_sat = EXCLUDED.total_sat,
+            reused_count = EXCLUDED.reused_count,
+            count = EXCLUDED.count
+    """, (tuple(affected_script_types),))
+
 def bulk_insert_utxos_copy(cur, utxo_rows):
     """
     Insert UTXOs into the main table using execute_values.
@@ -559,6 +609,7 @@ def process_single_block(height):
             deleted_balance_sat = 0
             deleted_type_balances: Dict[str, int] = defaultdict(int)
             deleted_type_counts: Dict[str, int] = defaultdict(int)
+            deleted_utxos = []
             
             if spend_rows:
                 spend_start = time.time()
@@ -592,6 +643,9 @@ def process_single_block(height):
             
             stats_batch = prepare_stats_batch(net_total_utxo, net_type_counts, net_total_balance_sat, net_type_balances)
             upsert_stats(cur, stats_batch)
+            
+            # Update address_stats table for affected script types
+            update_address_stats_incremental(cur, vout_rows, deleted_utxos)
         db_time = time.time() - db_start
         print(f"[Block {height}] Database write completed in {db_time:.3f}s")
         print(f"Processed block {height} ({blockhash[:16]}...)")

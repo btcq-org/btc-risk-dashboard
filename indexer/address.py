@@ -185,54 +185,6 @@ def check_address_reuse_from_blocks(start_block: int, num_blocks: int = 100):
     return updated_count
 
 
-def update_biggest_and_oldest_address_stats():
-    """
-    Find the biggest address (by balance) and oldest address (by created_block)
-    and add them to the stats table.
-    """
-    print("Finding biggest and oldest addresses...")
-    
-    with db.get_db_cursor() as cur:
-        # Get the biggest address by balance
-        cur.execute("""
-            SELECT address, balance_sat
-            FROM address_status
-            ORDER BY balance_sat DESC
-            LIMIT 1
-        """)
-        biggest_row = cur.fetchone()
-        
-        # Get the oldest address by created_block_timestamp
-        cur.execute("""
-            SELECT address, created_block_timestamp
-            FROM address_status
-            ORDER BY created_block_timestamp ASC
-            LIMIT 1
-        """)
-        oldest_row = cur.fetchone()
-        
-        # Insert/update stats
-        stats_updates = []
-        
-        if biggest_row:
-            biggest_address, biggest_balance = biggest_row
-            stats_updates.append(('biggest_address_balance_sat', biggest_balance))
-            print(f"Biggest address: {biggest_address} with balance: {biggest_balance} sat")
-        
-        if oldest_row:
-            oldest_address, oldest_timestamp = oldest_row
-            stats_updates.append(('oldest_address_timestamp', oldest_timestamp))
-            print(f"Oldest address: {oldest_address} created at timestamp: {oldest_timestamp}")
-        
-        if stats_updates:
-            stats_upsert_sql = """
-                INSERT INTO stats (key, value) VALUES %s
-                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-            """
-            execute_values(cur, stats_upsert_sql, stats_updates)
-            print(f"Updated {len(stats_updates)} address stats in stats table")
-
-
 def calculate_address_stats():
     """
     After address_status is complete, update address_stats with aggregated statistics.
@@ -328,10 +280,7 @@ def main():
         check_address_reuse_from_blocks(start_block, num_blocks)
     else:
         print("No blocks found in block_log. Skipping reuse check.")
-    
-    # Step 2.5: Update biggest and oldest address stats
-    update_biggest_and_oldest_address_stats()
-    
+   
     # Step 3: Update address_stats after address_status is complete
     # Ignore for now
     # calculate_address_stats()
