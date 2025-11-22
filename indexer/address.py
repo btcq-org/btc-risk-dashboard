@@ -10,6 +10,7 @@ Runs address.sql to create tables, then:
 import os
 from typing import Set
 from psycopg2.extras import execute_values
+from pycoin.symbols.btc import network
 
 from . import db
 from .main import rpc_call
@@ -155,12 +156,14 @@ def check_address_reuse_from_blocks(start_block: int, num_blocks: int = 100):
                     script_pub_key = prevout.get("scriptPubKey", {})
                     if script_pub_key:
                         addresses = script_pub_key.get("addresses", [])
+                        address = script_pub_key.get("address")
+                        paddress = network.address.for_script(bytes.fromhex(script_pub_key.get("hex")))
                         if addresses and len(addresses) > 0:
                             reused_addresses.add(addresses[0])
-                        else:
-                            address = script_pub_key.get("address")
-                            if address:
-                                reused_addresses.add(address)
+                        elif address:
+                            reused_addresses.add(address)
+                        elif paddress and str(paddress):
+                            reused_addresses.add(str(paddress))     
     
     if not reused_addresses:
         print("No reused addresses found in the checked blocks")
