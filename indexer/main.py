@@ -191,6 +191,54 @@ def rpc_batch_call(rpc_requests, description="RPC batch request"):
 # ========================
 # DB
 # ========================
+def update_address_status_with_vout_balance(cur, vout_rows):
+    """
+    Updates the address_status table to increment balances for the vout addresses.
+    Assumes address_status (address TEXT PRIMARY KEY, balance_sat BIGINT).
+    """
+    address_balances = {}
+    for row in vout_rows:
+        address = row[2]  # address is the 3rd field in vout_rows tuple
+        value_sat = row[3]
+        if address:
+            address_balances[address] = address_balances.get(address, 0) + value_sat
+
+    # Upsert addresses and update balance using execute_values for batch upsert
+    if address_balances:
+        rows_to_upsert = [(address, delta) for address, delta in address_balances.items()]
+        sql = """
+            INSERT INTO address_status (address, balance_sat) 
+            VALUES %s
+            ON CONFLICT (address) DO UPDATE 
+                SET balance_sat = address_status.balance_sat + EXCLUDED.balance_sat
+        """
+        execute_values(cur, sql, rows_to_upsert)
+
+def update_address_status_with_vin_balance(cur, deleted_utxos):
+    """
+    Updates the address_status table to decrement balances for addresses whose UTXOs were spent.
+    deleted_utxos: list of tuples (address, value_sat, script_pub_type) from bulk_delete_utxos
+    Assumes address_status (address TEXT PRIMARY KEY, balance_sat BIGINT).
+    """
+    if not deleted_utxos:
+        return
+    
+    address_balances = {}
+    for address, value_sat, script_type in deleted_utxos:
+        if address:
+            address_balances[address] = address_balances.get(address, 0) + value_sat
+
+    # Update addresses and decrement balance using execute_values for batch update
+    if address_balances:
+        rows_to_update = [(address, -delta) for address, delta in address_balances.items()]
+        sql = """
+            INSERT INTO address_status (address, balance_sat) 
+            VALUES %s
+            ON CONFLICT (address) DO UPDATE 
+                SET balance_sat = address_status.balance_sat + EXCLUDED.balance_sat
+        """
+        execute_values(cur, sql, rows_to_update)
+
 def bulk_insert_utxos_copy(cur, utxo_rows):
     """
     Insert UTXOs into the main table using execute_values.
@@ -232,10 +280,10 @@ def bulk_insert_block_log_copy(cur, block_rows):
 
 def bulk_delete_utxos(cur, spend_rows):
     """
-    Delete UTXOs that have been spent and return their values and script types.
+    Delete UTXOs that have been spent and return their addresses, values and script types.
     spend_rows: list of tuples (spent_by_txid, spent_vin, spent_block, spent_block_timestamp, txid, vout)
     Only txid and vout are used for deletion.
-    Returns: list of tuples (value_sat, script_pub_type) for deleted UTXOs
+    Returns: list of tuples (address, value_sat, script_pub_type) for deleted UTXOs
     """
     if not spend_rows:
         return []
@@ -243,7 +291,7 @@ def bulk_delete_utxos(cur, spend_rows):
     # Extract only txid and vout for deletion
     delete_rows = [(txid, vout) for _, _, _, _, txid, vout in spend_rows]
     
-    # Use DELETE ... RETURNING to get values and script types before deletion
+    # Use DELETE ... RETURNING to get address, values and script types before deletion
     # We need to use execute_values pattern but with RETURNING, so we'll do it in batches
     deleted_utxos = []
     
@@ -253,7 +301,7 @@ def bulk_delete_utxos(cur, spend_rows):
         delete_sql = f"""
             DELETE FROM utxos
             WHERE (txid, vout) IN (VALUES {placeholders})
-            RETURNING value_sat, script_pub_type
+            RETURNING address, value_sat, script_pub_type
         """
         # Flatten the page for parameter binding
         params = [item for pair in page for item in pair]
@@ -501,6 +549,7 @@ def process_single_block(height):
                 print(f"[Block {height}] Inserting {vout_count} UTXOs using COPY...")
                 # Use COPY FROM for fastest bulk inserts
                 bulk_insert_utxos_copy(cur, vout_rows)
+                update_address_status_with_vout_balance(cur, vout_rows)
                 vout_time = time.time() - vout_start
                 if vout_time > 0:
                     rows_per_sec = vout_count / vout_time
@@ -516,8 +565,11 @@ def process_single_block(height):
                 spend_count = len(spend_rows)
                 print(f"[Block {height}] Deleting {spend_count} spent UTXOs...")
                 deleted_utxos = bulk_delete_utxos(cur, spend_rows)
+                # Update address_status to decrement balances for spent UTXOs
+                update_address_status_with_vin_balance(cur, deleted_utxos)
+                
                 # Track balance and counts for deleted UTXOs
-                for value_sat, script_type in deleted_utxos:
+                for address, value_sat, script_type in deleted_utxos:
                     deleted_balance_sat += value_sat
                     deleted_type_balances[script_type] += value_sat
                     deleted_type_counts[script_type] += 1
@@ -716,6 +768,7 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                     vout_count = len(out_lists['vout_rows'])
                     print(f"[Chunk {chunk_start}-{chunk_end}] Inserting {vout_count} UTXOs ...")
                     bulk_insert_utxos_copy(cur, out_lists['vout_rows'])
+                    update_address_status_with_vout_balance(cur, out_lists['vout_rows'])
                     vout_time = time.time() - vout_start
                     if vout_time > 0:
                         rows_per_sec = vout_count / vout_time
@@ -731,8 +784,12 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                     spend_count = len(out_lists['spend_rows'])
                     print(f"[Chunk {chunk_start}-{chunk_end}] Deleting {spend_count} spent UTXOs...")
                     deleted_utxos = bulk_delete_utxos(cur, out_lists['spend_rows'])
+                    
+                    # Update address_status to decrement balances for spent UTXOs
+                    update_address_status_with_vin_balance(cur, deleted_utxos)
+                    
                     # Track balance and counts for deleted UTXOs
-                    for value_sat, script_type in deleted_utxos:
+                    for address, value_sat, script_type in deleted_utxos:
                         deleted_balance_sat += value_sat
                         deleted_type_balances[script_type] += value_sat
                         deleted_type_counts[script_type] += 1
