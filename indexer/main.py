@@ -194,20 +194,35 @@ def rpc_batch_call(rpc_requests, description="RPC batch request"):
 def update_address_status_with_vout_balance(cur, vout_rows):
     """
     Updates the address_status table to increment balances for the vout addresses.
-    Assumes address_status (address TEXT PRIMARY KEY, balance_sat BIGINT).
+    For new addresses, inserts all required fields: script_pub_type, reused, created_block, created_block_timestamp.
+    For existing addresses, only updates balance_sat.
+    vout_rows: list of tuples (txid, vout_idx, address, value_sat, script_pub_key_hex, script_type, height, block_ts)
     """
-    address_balances = {}
+    # Collect address data with all required fields for new addresses
+    # For addresses that appear multiple times, use the first occurrence's metadata
+    address_data = {}  # address -> (value_sat_sum, script_type, height, block_ts)
     for row in vout_rows:
         address = row[2]  # address is the 3rd field in vout_rows tuple
         value_sat = row[3]
+        script_type = row[5]  # script_pub_type
+        height = row[6]  # created_block
+        block_ts = row[7]  # created_block_timestamp
         if address:
-            address_balances[address] = address_balances.get(address, 0) + value_sat
+            if address not in address_data:
+                address_data[address] = (value_sat, script_type, height, block_ts)
+            else:
+                # Sum the balance, keep first occurrence's metadata
+                old_sum, script_type, height, block_ts = address_data[address]
+                address_data[address] = (old_sum + value_sat, script_type, height, block_ts)
 
-    # Upsert addresses and update balance using execute_values for batch upsert
-    if address_balances:
-        rows_to_upsert = [(address, delta) for address, delta in address_balances.items()]
+    # Upsert addresses with all required fields for new addresses
+    if address_data:
+        rows_to_upsert = [
+            (address, script_type, False, height, block_ts, value_sat)
+            for address, (value_sat, script_type, height, block_ts) in address_data.items()
+        ]
         sql = """
-            INSERT INTO address_status (address, balance_sat) 
+            INSERT INTO address_status (address, script_pub_type, reused, created_block, created_block_timestamp, balance_sat) 
             VALUES %s
             ON CONFLICT (address) DO UPDATE 
                 SET balance_sat = address_status.balance_sat + EXCLUDED.balance_sat
@@ -216,9 +231,9 @@ def update_address_status_with_vout_balance(cur, vout_rows):
 
 def update_address_status_with_vin_balance(cur, deleted_utxos):
     """
-    Updates the address_status table to decrement balances for addresses whose UTXOs were spent.
+    Updates the address_status table to decrement balances and mark as reused for addresses whose UTXOs were spent.
+    Seeing an address in a VIN means it's reused, so set reused = TRUE.
     deleted_utxos: list of tuples (address, value_sat, script_pub_type) from bulk_delete_utxos
-    Assumes address_status (address TEXT PRIMARY KEY, balance_sat BIGINT).
     """
     if not deleted_utxos:
         return
@@ -228,16 +243,20 @@ def update_address_status_with_vin_balance(cur, deleted_utxos):
         if address:
             address_balances[address] = address_balances.get(address, 0) + value_sat
 
-    # Update addresses and decrement balance using execute_values for batch update
+    # Update addresses: decrement balance and mark as reused
+    # Addresses being spent should already exist, but handle gracefully if they don't
     if address_balances:
-        rows_to_update = [(address, -delta) for address, delta in address_balances.items()]
-        sql = """
-            INSERT INTO address_status (address, balance_sat) 
-            VALUES %s
-            ON CONFLICT (address) DO UPDATE 
-                SET balance_sat = address_status.balance_sat + EXCLUDED.balance_sat
+        # Build VALUES clause manually for UPDATE
+        placeholders = ','.join(['(%s, %s)'] * len(address_balances))
+        params = [item for pair in [(addr, -delta) for addr, delta in address_balances.items()] for item in pair]
+        sql = f"""
+            UPDATE address_status
+            SET balance_sat = balance_sat + updates.balance_delta,
+                reused = TRUE
+            FROM (VALUES {placeholders}) AS updates(address, balance_delta)
+            WHERE address_status.address = updates.address
         """
-        execute_values(cur, sql, rows_to_update)
+        cur.execute(sql, params)
 
 def update_address_stats_incremental(cur, vout_rows, deleted_utxos):
     """
