@@ -13,7 +13,7 @@ from psycopg2.extras import execute_values
 from pycoin.symbols.btc import network
 
 from . import db
-from .main import rpc_call
+from .main import rpc_call, rpc_batch_call, RPCBatchError
 
 # ========================
 # CONFIGURATION
@@ -112,10 +112,11 @@ def check_address_reuse_from_blocks(start_block: int, num_blocks: int = 100):
     """
     Fetch multiple blocks and check if addresses are reused by looking at VINs.
     Uses verbose=4 to get addresses directly from VINs, then updates address_status.
+    Uses RPC batching with retry logic (up to 5 retries) similar to main.py.
     
     Args:
         start_block: The starting block height to check for address reuse
-        num_blocks: Number of blocks to check (default: 1)
+        num_blocks: Number of blocks to check (default: 100)
     
     Returns:
         int: Number of addresses marked as reused
@@ -125,20 +126,40 @@ def check_address_reuse_from_blocks(start_block: int, num_blocks: int = 100):
     # Collect all addresses from VINs (reused addresses)
     reused_addresses = set()
     
-    # Process all blocks
-    for block_offset in range(num_blocks):
-        block_height = start_block + block_offset
+    # Process blocks in batches using RPC batching
+    block_heights = list(range(start_block, start_block + num_blocks))
+    
+    if not block_heights:
+        print("No blocks to process")
+        return 0
+    
+    hash_results = {}
+    block_results = {}
+    
+    try:
+        # Batch getblockhash calls for all blocks
+        hash_batch_requests = [("getblockhash", [height], height) for height in block_heights]
+        hash_results = rpc_batch_call(hash_batch_requests, description=f"getblockhash {start_block}-{start_block + num_blocks - 1}")
         
-        try:
-            blockhash = rpc_call("getblockhash", [block_height])
-            # Use verbose=4 to get addresses directly in VINs
-            block = rpc_call("getblock", [blockhash, 4])
-        except Exception as e:
-            error_msg = str(e)
-            if "not found" in error_msg.lower() or "invalid" in error_msg.lower():
-                print(f"Block {block_height} not found. Skipping...")
-                continue
-            print(f"Error reading block {block_height}: {e}")
+        # Batch getblock calls for all block hashes (using verbose=4 to get addresses in VINs)
+        block_batch_requests = [("getblock", [hash_results[height], 4], height) for height in block_heights if height in hash_results]
+        block_results = rpc_batch_call(block_batch_requests, description=f"getblock {start_block}-{start_block + num_blocks - 1}")
+        
+    except RPCBatchError as e:
+        print(f"Fatal RPC failure while fetching blocks {start_block}-{start_block + num_blocks - 1}: {e}")
+        # Continue with whatever blocks we successfully fetched
+        if not block_results:
+            return 0
+    
+    # Process all successfully fetched blocks
+    for block_height in block_heights:
+        if block_height not in block_results:
+            print(f"Block {block_height} not found or failed to fetch. Skipping...")
+            continue
+        
+        block = block_results[block_height]
+        if block is None:
+            print(f"Block {block_height} returned None. Skipping...")
             continue
         
         # Process all transactions in the block
@@ -157,13 +178,19 @@ def check_address_reuse_from_blocks(start_block: int, num_blocks: int = 100):
                     if script_pub_key:
                         addresses = script_pub_key.get("addresses", [])
                         address = script_pub_key.get("address")
-                        paddress = network.address.for_script(bytes.fromhex(script_pub_key.get("hex")))
+                        script_hex = script_pub_key.get("hex")
                         if addresses and len(addresses) > 0:
                             reused_addresses.add(addresses[0])
                         elif address:
                             reused_addresses.add(address)
-                        elif paddress and str(paddress):
-                            reused_addresses.add(str(paddress))     
+                        elif script_hex:
+                            try:
+                                paddress = network.address.for_script(bytes.fromhex(script_hex))
+                                if paddress and str(paddress):
+                                    reused_addresses.add(str(paddress))
+                            except Exception:
+                                # Skip if we can't parse the script
+                                pass
     
     if not reused_addresses:
         print("No reused addresses found in the checked blocks")
