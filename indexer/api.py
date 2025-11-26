@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from . import db
 from psycopg2.extras import RealDictCursor
+from typing import Optional
 
 app = FastAPI()
 
@@ -119,6 +120,88 @@ def stats_supply():
                 "total_supply_sat": total_supply_sat,
                 "script_type_balances": script_type_balances,
             }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/address/status")
+def address_status_list(
+    script_type: Optional[str] = Query(None, description="Filter by script_pub_type"),
+    reused: Optional[bool] = Query(None, description="Filter by reused flag"),
+    address: Optional[str] = Query(None, description="Exact address to fetch"),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    """Return address_status rows with optional filtering."""
+    try:
+        with db.get_db_cursor(cursor_factory=RealDictCursor) as cur:
+            where_clauses = []
+            params = []
+
+            if address:
+                where_clauses.append("address = %s")
+                params.append(address)
+
+            if script_type:
+                where_clauses.append("script_pub_type = %s")
+                params.append(script_type)
+            if reused is not None:
+                where_clauses.append("reused = %s")
+                params.append(reused)
+
+            where_sql = ""
+            if where_clauses:
+                where_sql = " WHERE " + " AND ".join(where_clauses)
+
+            count_sql = f"SELECT COUNT(*)::bigint AS total FROM address_status{where_sql}"
+            cur.execute(count_sql, params)
+            total = int(cur.fetchone()["total"])
+
+            query_sql = f"""
+                SELECT
+                    address,
+                    script_pub_type,
+                    reused,
+                    created_block,
+                    created_block_timestamp,
+                    balance_sat
+                FROM address_status
+                {where_sql}
+                ORDER BY balance_sat DESC
+                LIMIT %s OFFSET %s
+            """
+            query_params = params + [limit, offset]
+            cur.execute(query_sql, query_params)
+            rows = cur.fetchall()
+
+        return {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "results": rows,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/address/stats")
+def address_stats():
+    """Return aggregated address stats from address_stats table."""
+    try:
+        with db.get_db_cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT 
+                    script_pub_type,
+                    reused_count,
+                    count,
+                    reused_sat,
+                    total_sat
+                FROM address_stats
+                ORDER BY script_pub_type
+            """)
+            rows = cur.fetchall()
+
+        return {"results": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
