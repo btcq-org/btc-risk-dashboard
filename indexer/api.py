@@ -210,34 +210,23 @@ def search(q: str = Query(..., min_length=1)):
     results = []
     try:
         with db.get_db_cursor(cursor_factory=RealDictCursor) as cur:
-            # Search for address - uses utxos_address_idx index
-            # Optimized to use index on address column
+            # Search for address - uses address_status table
+            # Optimized to use primary key index on address column
+            # Includes UTXO count from utxos table
             cur.execute("""
                 SELECT
-                    address,
-                    MIN(created_block) AS first_seen_block,
-                    MIN(created_block_timestamp) AS first_seen_block_timestamp,
-                    GREATEST(
-                        COALESCE(MAX(created_block), 0),
-                        COALESCE(MAX(spent_block), 0)
-                    ) AS last_seen_block,
-                    GREATEST(
-                        COALESCE(MAX(created_block_timestamp), 0),
-                        COALESCE(MAX(spent_block_timestamp), 0)
-                    ) AS last_seen_block_timestamp,
-                    SUM(CASE WHEN NOT spent THEN value_sat ELSE 0 END) AS balance_sat,
-                    COUNT(*) FILTER (WHERE NOT spent) AS utxo_count,
-                    COUNT(*) AS appearances,
-                    (SELECT script_pub_type 
-                     FROM utxos u2 
-                     WHERE u2.address = utxos.address 
-                     ORDER BY CASE WHEN NOT u2.spent THEN 0 ELSE 1 END, 
-                              u2.created_block DESC, 
-                              u2.created_block_timestamp DESC 
-                     LIMIT 1) AS script_pub_type
-                FROM utxos
-                WHERE address = %s
-                GROUP BY address
+                    as_table.address,
+                    as_table.script_pub_type,
+                    as_table.reused,
+                    as_table.created_block,
+                    as_table.created_block_timestamp,
+                    as_table.balance_sat,
+                    COUNT(u.txid) AS utxo_count
+                FROM address_status as_table
+                LEFT JOIN utxos u ON u.address = as_table.address
+                WHERE as_table.address = %s
+                GROUP BY as_table.address, as_table.script_pub_type, as_table.reused, 
+                         as_table.created_block, as_table.created_block_timestamp, as_table.balance_sat
             """, (q,))
             for row in cur.fetchall():
                 row['source'] = 'address_status'
