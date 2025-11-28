@@ -9,7 +9,7 @@ Runs address.sql to create tables, then:
 """
 import os
 from typing import Set
-from psycopg2.extras import execute_values
+from psycopg2.extras import execute_values, RealDictCursor
 from pycoin.symbols.btc import network
 
 from . import db
@@ -108,7 +108,7 @@ def calculate_addresses_from_utxos(return_total: bool = False):
             return inserted_count
 
 
-def check_address_reuse_from_blocks(start_block: int, num_blocks: int = 100):
+def check_address_reuse_from_blocks(start_block: int, num_blocks: int = 10):
     """
     Fetch multiple blocks and check if addresses are reused by looking at VINs.
     Uses verbose=4 to get addresses directly from VINs, then updates address_status.
@@ -285,6 +285,79 @@ def get_latest_block_height():
         return None
 
 
+def get_biggest_and_oldest_address():
+    """
+    Calculate and return the biggest address (by balance_sat) and oldest address (by created block).
+    Also inserts these values into address_global_stats table as biggest_balance and oldest_address.
+    
+    Returns:
+        dict: Dictionary with two keys:
+            - 'biggest': dict with address, balance_sat, and other address details
+            - 'oldest': dict with address, first_seen_block (created block), and other address details
+            Returns None for each if no addresses found.
+    """
+    try:
+        with db.get_db_cursor(cursor_factory=RealDictCursor) as cur:
+            # Create the address_global_stats table if it doesn't exist
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS address_global_stats (
+                    id INTEGER PRIMARY KEY DEFAULT 1,
+                    biggest_balance BIGINT,
+                    oldest_address TEXT,
+                    CHECK (id = 1)
+                )
+            """)
+            
+            # Get the biggest address (highest balance_sat)
+            cur.execute("""
+                SELECT 
+                    address,
+                    created_block,
+                    created_block_timestamp,
+                    balance_sat,
+                    script_pub_type
+                FROM address_status
+                WHERE balance_sat > 0
+                ORDER BY balance_sat DESC
+                LIMIT 1
+            """)
+            biggest = cur.fetchone()
+            
+            # Get the oldest address (lowest created_block, which is the created block)
+            cur.execute("""
+                SELECT 
+                    address,
+                    created_block,
+                    created_block_timestamp,
+                    balance_sat,
+                    script_pub_type
+                FROM address_status
+                ORDER BY created_block ASC
+                LIMIT 1
+            """)
+            oldest = cur.fetchone()
+            
+            # Insert/update biggest_balance and oldest_address into address_global_stats
+            if biggest or oldest:
+                biggest_balance = biggest['balance_sat'] if biggest else None
+                oldest_address = oldest['created_block'] if oldest else None
+                
+                cur.execute("""
+                    INSERT INTO address_global_stats (id, biggest_balance, oldest_address)
+                    VALUES (1, %s, %s)
+                    ON CONFLICT (id) DO UPDATE SET
+                        biggest_balance = EXCLUDED.biggest_balance,
+                        oldest_address = EXCLUDED.oldest_address
+                """, (biggest_balance, oldest_address))
+            
+            return {
+                "biggest": dict(biggest) if biggest else None,
+                "oldest": dict(oldest) if oldest else None
+            }
+    except Exception as e:
+        print(f"Error getting biggest and oldest address: {e}")
+        return {"biggest": None, "oldest": None}
+
 def main():
     """Main function to process addresses"""
     print("=" * 70)
@@ -301,29 +374,30 @@ def main():
     # calculate_addresses_from_utxos()
     
     # Step 2: Get the latest block height and check for address reuse
-    latest_block = get_latest_block_height()
-    if latest_block is not None:
-        print(f"\nChecking address reuse in blocks from 1 to {latest_block}...")
-        # Check all blocks from the start (block 1) until latest block in chunks
-        chunk_size = 100
-        start_block = 1
-        total_updated = 0
+    # latest_block = get_latest_block_height()
+    # if latest_block is not None:
+    #     print(f"\nChecking address reuse in blocks from 1 to {latest_block}...")
+    #     # Check all blocks from the start (block 1) until latest block in chunks
+    #     chunk_size = 10
+    #     start_block = 924000
+    #     total_updated = 0
         
-        while start_block <= latest_block:
-            # Calculate how many blocks to process in this chunk
-            num_blocks = min(chunk_size, latest_block - start_block + 1)
-            print(f"\nProcessing blocks {start_block} to {start_block + num_blocks - 1}...")
-            updated = check_address_reuse_from_blocks(start_block, num_blocks)
-            total_updated += updated
-            start_block += chunk_size
+    #     while start_block <= latest_block:
+    #         # Calculate how many blocks to process in this chunk
+    #         num_blocks = min(chunk_size, latest_block - start_block + 1)
+    #         print(f"\nProcessing blocks {start_block} to {start_block + num_blocks - 1}...")
+    #         updated = check_address_reuse_from_blocks(start_block, num_blocks)
+    #         total_updated += updated
+    #         start_block += chunk_size
         
-        print(f"\nTotal addresses marked as reused: {total_updated}")
-    else:
-        print("No blocks found in block_log. Skipping reuse check.")
+    #     print(f"\nTotal addresses marked as reused: {total_updated}")
+    # else:
+    #     print("No blocks found in block_log. Skipping reuse check.")
    
     # Step 3: Update address_stats after address_status is complete
-    # Ignore for now
     # calculate_address_stats()
+
+    get_biggest_and_oldest_address()
     
     print("\n" + "=" * 70)
     print("Address processing complete!")
