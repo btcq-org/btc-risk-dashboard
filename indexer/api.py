@@ -210,6 +210,18 @@ def search(q: str = Query(..., min_length=1)):
     results = []
     try:
         with db.get_db_cursor(cursor_factory=RealDictCursor) as cur:
+            # Get global stats for risk score calculation from address_global_stats
+            cur.execute("""
+                SELECT biggest_balance
+                FROM address_global_stats
+                WHERE id = 1
+            """)
+            global_stats = cur.fetchone()
+            max_balance_sat = global_stats['biggest_balance'] if global_stats and global_stats['biggest_balance'] else 0
+            
+            # Set newest block as constant for age score calculation
+            newest_block = 940000
+
             # Search for address - uses address_status table
             # Optimized to use primary key index on address column
             # Includes UTXO count from utxos table
@@ -230,6 +242,29 @@ def search(q: str = Query(..., min_length=1)):
             """, (q,))
             for row in cur.fetchall():
                 row['source'] = 'address_status'
+                
+                # Calculate address risk score
+                address_balance = row['balance_sat'] or 0
+                address_block = row['created_block'] or 0
+                
+                # Balance score: biggest address = 10
+                if max_balance_sat > 0:
+                    balance_score = min(10.0, (address_balance / max_balance_sat) * 10.0)
+                else:
+                    balance_score = 0.0
+                
+                # Age score: based on address block relative to newest block
+                # Formula: (address_block / newest_block) * 10
+                age_score = (address_block / newest_block) * 10.0
+                age_score = max(0.0, min(10.0, age_score))  # Clamp between 0 and 10
+                
+                # Combined risk score: average of balance and age (0-10)
+                risk_score = (balance_score + age_score) / 2.0
+                risk_score = max(0.0, min(10.0, risk_score))  # Clamp between 0 and 10
+                
+                row['balance_risk_score'] = round(balance_score, 2)
+                row['age_risk_score'] = round(age_score, 2)
+                row['risk_score'] = round(risk_score, 2)
                 results.append(row)
 
             # Search utxos for txid (as created transaction) - uses PRIMARY KEY index on (txid, vout)
