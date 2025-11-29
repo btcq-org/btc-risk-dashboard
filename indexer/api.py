@@ -255,7 +255,7 @@ def search(q: str = Query(..., min_length=1)):
                 
                 # Age score: based on address block relative to newest block
                 # Formula: (address_block / newest_block) * 10
-                age_score = (address_block / newest_block) * 10.0
+                age_score = (1 - (address_block / newest_block)) * 10.0
                 age_score = max(0.0, min(10.0, age_score))  # Clamp between 0 and 10
                 
                 # Combined risk score: average of balance and age (0-10)
