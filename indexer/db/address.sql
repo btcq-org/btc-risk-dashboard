@@ -18,3 +18,10 @@ CREATE TABLE IF NOT EXISTS address_stats (
     count BIGINT NOT NULL DEFAULT 0,
     PRIMARY KEY (script_pub_type)
 );
+
+CREATE TABLE IF NOT EXISTS address_global_stats (
+    id INTEGER PRIMARY KEY DEFAULT 1,
+    biggest_balance BIGINT,
+    oldest_address TEXT,
+    CHECK (id = 1)
+);
