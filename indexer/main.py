@@ -1051,9 +1051,9 @@ def main():
             db.shutdown_pool()
             return
 
-        if start <= tip + 20:
-            print(f"Catching up: processing blocks {start} → {tip}")
-            process_range(start, tip)
+        # if start <= tip + 20:
+        #     print(f"Catching up: processing blocks {start} → {tip}")
+        #     process_range(start, tip)
 
         if shutdown_requested:
             print("Shutdown requested during catch-up, exiting...")
@@ -1064,22 +1064,22 @@ def main():
         print("Catch-up complete. Entering continuous sync mode...")
 
         # Recreate address index if missing
-        with db.get_db_cursor() as cur:
-            cur.execute("CREATE INDEX IF NOT EXISTS utxos_address_idx ON utxos (address);")
-            # Check if primary key exists before adding it
-            cur.execute("""
-                DO $$
-                BEGIN
-                    IF NOT EXISTS (
-                        SELECT 1 FROM pg_constraint 
-                        WHERE conname = 'utxos_pkey' 
-                        AND conrelid = 'utxos'::regclass
-                    ) THEN
-                        ALTER TABLE utxos ADD PRIMARY KEY (txid, vout);
-                    END IF;
-                END $$;
-            """)
-            cur.connection.commit()
+        # with db.get_db_cursor() as cur:
+        #     cur.execute("CREATE INDEX IF NOT EXISTS utxos_address_idx ON utxos (address);")
+        #     # Check if primary key exists before adding it
+        #     cur.execute("""
+        #         DO $$
+        #         BEGIN
+        #             IF NOT EXISTS (
+        #                 SELECT 1 FROM pg_constraint 
+        #                 WHERE conname = 'utxos_pkey' 
+        #                 AND conrelid = 'utxos'::regclass
+        #             ) THEN
+        #                 ALTER TABLE utxos ADD PRIMARY KEY (txid, vout);
+        #             END IF;
+        #         END $$;
+        #     """)
+        #     cur.connection.commit()
         
         while not shutdown_requested:
             try:
