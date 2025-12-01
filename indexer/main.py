@@ -229,34 +229,52 @@ def update_address_status_with_vout_balance(cur, vout_rows):
         """
         execute_values(cur, sql, rows_to_upsert)
 
-def update_address_status_with_vin_balance(cur, deleted_utxos):
+def update_address_status_with_vin_balance(cur, deleted_utxos, height=None, block_ts=None):
     """
     Updates the address_status table to decrement balances and mark as reused for addresses whose UTXOs were spent.
     Seeing an address in a VIN means it's reused, so set reused = TRUE.
+    If an address doesn't exist, it will be created with reused=TRUE and the appropriate balance.
     deleted_utxos: list of tuples (address, value_sat, script_pub_type) from bulk_delete_utxos
+    height: optional block height for new addresses (used as created_block)
+    block_ts: optional block timestamp for new addresses (used as created_block_timestamp)
     """
     if not deleted_utxos:
         return
     
-    address_balances = {}
+    # Collect address data: balance delta and script_type (use first occurrence)
+    address_data = {}  # address -> (balance_delta, script_type)
     for address, value_sat, script_type in deleted_utxos:
         if address:
-            address_balances[address] = address_balances.get(address, 0) + value_sat
+            if address not in address_data:
+                address_data[address] = (-value_sat, script_type)
+            else:
+                # Sum the balance delta, keep first occurrence's script_type
+                old_delta, script_type = address_data[address]
+                address_data[address] = (old_delta - value_sat, script_type)
 
-    # Update addresses: decrement balance and mark as reused
-    # Addresses being spent should already exist, but handle gracefully if they don't
-    if address_balances:
-        # Build VALUES clause manually for UPDATE
-        placeholders = ','.join(['(%s, %s)'] * len(address_balances))
-        params = [item for pair in [(addr, -delta) for addr, delta in address_balances.items()] for item in pair]
-        sql = f"""
-            UPDATE address_status
-            SET balance_sat = balance_sat + updates.balance_delta,
-                reused = TRUE
-            FROM (VALUES {placeholders}) AS updates(address, balance_delta)
-            WHERE address_status.address = updates.address
+    # Upsert addresses: create new ones if they don't exist, update existing ones
+    if address_data:
+        # Prepare rows for upsert
+        rows_to_upsert = []
+        for address, (balance_delta, script_type) in address_data.items():
+            # For new addresses, use provided height/block_ts or NULL
+            rows_to_upsert.append((
+                address,
+                script_type,
+                True,  # reused = TRUE (address is being spent)
+                height if height is not None else None,  # created_block
+                block_ts if block_ts is not None else None,  # created_block_timestamp
+                balance_delta  # balance_sat (negative value for decrement)
+            ))
+        
+        sql = """
+            INSERT INTO address_status (address, script_pub_type, reused, created_block, created_block_timestamp, balance_sat) 
+            VALUES %s
+            ON CONFLICT (address) DO UPDATE 
+                SET balance_sat = address_status.balance_sat + EXCLUDED.balance_sat,
+                    reused = TRUE
         """
-        cur.execute(sql, params)
+        execute_values(cur, sql, rows_to_upsert)
 
 def update_address_stats_incremental(cur, vout_rows, deleted_utxos):
     """
@@ -636,7 +654,7 @@ def process_single_block(height):
                 print(f"[Block {height}] Deleting {spend_count} spent UTXOs...")
                 deleted_utxos = bulk_delete_utxos(cur, spend_rows)
                 # Update address_status to decrement balances for spent UTXOs
-                update_address_status_with_vin_balance(cur, deleted_utxos)
+                update_address_status_with_vin_balance(cur, deleted_utxos, height=height, block_ts=block_ts)
                 
                 # Track balance and counts for deleted UTXOs
                 for address, value_sat, script_type in deleted_utxos:
@@ -664,7 +682,7 @@ def process_single_block(height):
             upsert_stats(cur, stats_batch)
             
             # Update address_stats table for affected script types
-            update_address_stats_incremental(cur, vout_rows, deleted_utxos)
+            # update_address_stats_incremental(cur, vout_rows, deleted_utxos)
         db_time = time.time() - db_start
         print(f"[Block {height}] Database write completed in {db_time:.3f}s")
         print(f"Processed block {height} ({blockhash[:16]}...)")
@@ -858,8 +876,13 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                     print(f"[Chunk {chunk_start}-{chunk_end}] Deleting {spend_count} spent UTXOs...")
                     deleted_utxos = bulk_delete_utxos(cur, out_lists['spend_rows'])
                     
+                    # Extract max block height and timestamp from spend_rows for new address creation
+                    # spend_rows structure: (spent_by_txid, spent_vin, spent_block, spent_block_timestamp, txid, vout)
+                    max_height = max(row[2] for row in out_lists['spend_rows']) if out_lists['spend_rows'] else None
+                    max_block_ts = max(row[3] for row in out_lists['spend_rows']) if out_lists['spend_rows'] else None
+                    
                     # Update address_status to decrement balances for spent UTXOs
-                    update_address_status_with_vin_balance(cur, deleted_utxos)
+                    update_address_status_with_vin_balance(cur, deleted_utxos, height=max_height, block_ts=max_block_ts)
                     
                     # Track balance and counts for deleted UTXOs
                     for address, value_sat, script_type in deleted_utxos:
@@ -1051,9 +1074,9 @@ def main():
             db.shutdown_pool()
             return
 
-        # if start <= tip + 20:
-        #     print(f"Catching up: processing blocks {start} → {tip}")
-        #     process_range(start, tip)
+        if start <= tip + 20:
+            print(f"Catching up: processing blocks {start} → {tip}")
+            process_range(start, tip)
 
         if shutdown_requested:
             print("Shutdown requested during catch-up, exiting...")
@@ -1064,22 +1087,22 @@ def main():
         print("Catch-up complete. Entering continuous sync mode...")
 
         # Recreate address index if missing
-        # with db.get_db_cursor() as cur:
-        #     cur.execute("CREATE INDEX IF NOT EXISTS utxos_address_idx ON utxos (address);")
-        #     # Check if primary key exists before adding it
-        #     cur.execute("""
-        #         DO $$
-        #         BEGIN
-        #             IF NOT EXISTS (
-        #                 SELECT 1 FROM pg_constraint 
-        #                 WHERE conname = 'utxos_pkey' 
-        #                 AND conrelid = 'utxos'::regclass
-        #             ) THEN
-        #                 ALTER TABLE utxos ADD PRIMARY KEY (txid, vout);
-        #             END IF;
-        #         END $$;
-        #     """)
-        #     cur.connection.commit()
+        with db.get_db_cursor() as cur:
+            cur.execute("CREATE INDEX IF NOT EXISTS utxos_address_idx ON utxos (address);")
+            # Check if primary key exists before adding it
+            cur.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint 
+                        WHERE conname = 'utxos_pkey' 
+                        AND conrelid = 'utxos'::regclass
+                    ) THEN
+                        ALTER TABLE utxos ADD PRIMARY KEY (txid, vout);
+                    END IF;
+                END $$;
+            """)
+            cur.connection.commit()
         
         while not shutdown_requested:
             try:
