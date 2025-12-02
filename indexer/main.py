@@ -5,19 +5,21 @@ and stores them in PostgreSQL for efficient querying.
 """
 from bitcoin import SelectParams
 
-import requests, json
-import time
+import json
+import os
 import signal
 import sys
-import os
+import time
+import csv
 
-from typing import Generator, Dict, Any, List
+import requests
+
 from collections import defaultdict
-from psycopg2.extras import execute_batch, execute_values
+from typing import Dict, List
+from psycopg2.extras import execute_values
+
 from . import db
 from .utils import detect_script_type, address_from_vout, get_script_type
-
-import csv
 
 # ========================
 # CONFIGURATION
@@ -39,7 +41,7 @@ CHUNK_SIZE = int(os.getenv('CHUNK_SIZE', '10'))                    # blocks per 
 MAX_RETRIES = int(os.getenv('MAX_RETRIES', '5'))                    # max retries for failed RPC
 DB_PAGE_ROWS = int(os.getenv('DB_PAGE_ROWS', '1000'))              # rows per DB insert page
 IS_UTXO = bool(int(os.getenv('IS_UTXO', '0')))                      # whether indexing UTXOs (True) or TXOs (False)
-IS_RECALC = bool(int(os.getenv('IS_RECALC', '0'))) 
+IS_RECALC = bool(int(os.getenv('IS_RECALC', '0')))
 
 # ========================
 # RPC UTILS
@@ -222,9 +224,9 @@ def update_address_status_with_vout_balance(cur, vout_rows):
             for address, (value_sat, script_type, height, block_ts) in address_data.items()
         ]
         sql = """
-            INSERT INTO address_status (address, script_pub_type, reused, created_block, created_block_timestamp, balance_sat) 
+            INSERT INTO address_status (address, script_pub_type, reused, created_block, created_block_timestamp, balance_sat)
             VALUES %s
-            ON CONFLICT (address) DO UPDATE 
+            ON CONFLICT (address) DO UPDATE
                 SET balance_sat = address_status.balance_sat + EXCLUDED.balance_sat
         """
         execute_values(cur, sql, rows_to_upsert)
@@ -240,7 +242,7 @@ def update_address_status_with_vin_balance(cur, deleted_utxos, height=None, bloc
     """
     if not deleted_utxos:
         return
-    
+
     # Collect address data: balance delta and script_type (use first occurrence)
     address_data = {}  # address -> (balance_delta, script_type)
     for address, value_sat, script_type in deleted_utxos:
@@ -266,11 +268,11 @@ def update_address_status_with_vin_balance(cur, deleted_utxos, height=None, bloc
                 block_ts if block_ts is not None else None,  # created_block_timestamp
                 balance_delta  # balance_sat (negative value for decrement)
             ))
-        
+
         sql = """
-            INSERT INTO address_status (address, script_pub_type, reused, created_block, created_block_timestamp, balance_sat) 
+            INSERT INTO address_status (address, script_pub_type, reused, created_block, created_block_timestamp, balance_sat)
             VALUES %s
-            ON CONFLICT (address) DO UPDATE 
+            ON CONFLICT (address) DO UPDATE
                 SET balance_sat = address_status.balance_sat + EXCLUDED.balance_sat,
                     reused = TRUE
         """
@@ -285,21 +287,21 @@ def update_address_stats_incremental(cur, vout_rows, deleted_utxos):
     """
     # Collect all script types that were affected
     affected_script_types = set()
-    
+
     # Process vouts (additions)
     for row in vout_rows:
         script_type = row[5]  # script_pub_type is the 6th field
         if script_type:
             affected_script_types.add(script_type)
-    
+
     # Process deleted UTXOs (subtractions)
     for address, value_sat, script_type in deleted_utxos:
         if script_type:
             affected_script_types.add(script_type)
-    
+
     if not affected_script_types:
         return
-    
+
     # Recalculate address_stats for affected script types from address_status
     # This ensures accuracy since address_status has been updated with balance changes
     cur.execute("""
@@ -310,7 +312,7 @@ def update_address_stats_incremental(cur, vout_rows, deleted_utxos):
             reused_count,
             count
         )
-        SELECT 
+        SELECT
             script_pub_type,
             SUM(CASE WHEN reused THEN balance_sat ELSE 0 END) AS reused_sat,
             SUM(balance_sat) AS total_sat,
@@ -332,7 +334,7 @@ def bulk_insert_utxos_copy(cur, utxo_rows):
     """
     if not utxo_rows:
         return
-    
+
     insert_sql = """
         INSERT INTO utxos (
             txid,
@@ -353,7 +355,7 @@ def bulk_insert_block_log_copy(cur, block_rows):
     """Insert block_log entries using execute_values."""
     if not block_rows:
         return
-    
+
     insert_sql = """
         INSERT INTO block_log (
             block_height,
@@ -374,14 +376,14 @@ def bulk_delete_utxos(cur, spend_rows):
     """
     if not spend_rows:
         return []
-    
+
     # Extract only txid and vout for deletion
     delete_rows = [(txid, vout) for _, _, _, _, txid, vout in spend_rows]
-    
+
     # Use DELETE ... RETURNING to get address, values and script types before deletion
     # We need to use execute_values pattern but with RETURNING, so we'll do it in batches
     deleted_utxos = []
-    
+
     for page in [delete_rows[i:i+DB_PAGE_ROWS] for i in range(0, len(delete_rows), DB_PAGE_ROWS)]:
         # Build the VALUES clause manually for this page
         placeholders = ','.join(['(%s, %s)'] * len(page))
@@ -394,7 +396,7 @@ def bulk_delete_utxos(cur, spend_rows):
         params = [item for pair in page for item in pair]
         cur.execute(delete_sql, params)
         deleted_utxos.extend(cur.fetchall())
-    
+
     return deleted_utxos
 
 def prepare_stats_batch(total_utxo: int, type_counts: Dict[str, int], total_balance_sat: int = 0, type_balances: Dict[str, int] = None) -> List[tuple]:
@@ -452,18 +454,18 @@ def recalculate_stats_from_db(cur):
         FROM utxos
         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
     """)
-    
+
     cur.execute("""
         INSERT INTO stats (key, value)
         SELECT 'total_balance_sat', COALESCE(SUM(value_sat), 0)::bigint
         FROM utxos
         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
     """)
-    
+
     # Recalculate counts and balances per script type
     cur.execute("""
         INSERT INTO stats (key, value)
-        SELECT 
+        SELECT
             script_pub_type || '_count' AS key,
             COUNT(*)::bigint AS value
         FROM utxos
@@ -471,10 +473,10 @@ def recalculate_stats_from_db(cur):
         GROUP BY script_pub_type
         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
     """)
-    
+
     cur.execute("""
         INSERT INTO stats (key, value)
-        SELECT 
+        SELECT
             script_pub_type || '_balance_sat' AS key,
             COALESCE(SUM(value_sat), 0)::bigint AS value
         FROM utxos
@@ -482,7 +484,7 @@ def recalculate_stats_from_db(cur):
         GROUP BY script_pub_type
         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
     """)
-    
+
     # Remove stats for script types that no longer exist in the database
     cur.execute("""
         DELETE FROM stats
@@ -496,24 +498,23 @@ def recalculate_stats_from_db(cur):
     """)
 
 def schema_init():
-    import os
     schema_path = os.path.join(os.path.dirname(__file__), "db", "schema.sql")
     db.init_pool()
     with db.get_db_cursor() as cur:
         # Check if block_log table exists (indicates schema is already initialized)
         cur.execute("""
             SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_schema = 'public' 
+                SELECT FROM information_schema.tables
+                WHERE table_schema = 'public'
                 AND table_name = 'block_log'
             )
         """)
         table_exists = cur.fetchone()[0]
-        
+
         if table_exists:
             print("Schema already initialized (block_log table exists), skipping initialization.")
             return
-        
+
         # Schema not initialized, run the SQL
         print("Initializing database schema...")
         with open(schema_path, "r") as sf:
@@ -535,59 +536,39 @@ def signal_handler(signum, frame):
 # ========================
 # Range processing
 # ========================
-def get_last_processed_height():
-    try:
-        with db.get_db_cursor() as cur:
-            cur.execute("SELECT MAX(block_height) FROM block_log")
-            row = cur.fetchone()
-            return row[0] if row and row[0] is not None else 0
-    except Exception as e:
-        print(f"Error getting last processed height: {e}")
-        return 0
-
-def process_single_block(height):
-    """Process a single block and extract VOUTs (UTXOs) to database."""
+def _extract_block_data(block, height, blockhash):
+    """
+    Extract VOUTs (UTXOs) and VINs (spends) from a block.
+    Returns: tuple of (vout_rows, spend_rows, stats_dict) or None if shutdown requested.
+    """
     if shutdown_requested:
-        return False
-    
-    try:
-        blockhash = rpc_call("getblockhash", [height])
-        block = rpc_call("getblock", [blockhash, 3])
-    except Exception as e:
-        # Handle case where block is not yet available during sync
-        error_msg = str(e)
-        if "not found" in error_msg.lower() or "invalid" in error_msg.lower():
-            print(f"Block {height} not yet available (bitcoind may still be syncing)")
-            return False
-        print(f"Error reading block {height}: {e}")
-        return False
-    
+        return None
+
     block_time = block.get('time', 0)
     block_ts = int(block_time * 1_000_000_000)
-    
+
     vout_rows = []
     spend_rows = []
     type_counts: Dict[str, int] = defaultdict(int)
     type_balances: Dict[str, int] = defaultdict(int)
     total_utxo = 0
     total_balance_sat = 0
-    
+
     for tx in block.get("tx", []):
         txid = tx.get("txid", "")
         if shutdown_requested:
-            print(f"Shutdown requested while scanning transactions for block {height}")
-            return False
-        
+            return None
+
         # Process vins (transaction inputs) to identify spent UTXOs for deletion
         for vin_idx, vin in enumerate(tx.get("vin", [])):
             # Skip coinbase transactions (they don't have valid txid/vout references)
             if "coinbase" in vin:
                 continue
-            
+
             # Extract the UTXO being spent
             spent_txid = vin.get("txid")
             spent_vout = vin.get("vout")
-            
+
             # Only process if we have valid references
             if spent_txid and spent_vout is not None:
                 spend_rows.append((
@@ -598,7 +579,7 @@ def process_single_block(height):
                     spent_txid,  # txid (the UTXO being spent)
                     spent_vout  # vout (the UTXO being spent)
                 ))
-        
+
         # Process vouts (transaction outputs) to create new UTXOs
         for idx, v in enumerate(tx.get("vout", [])):
             spk = v.get("scriptPubKey", {})
@@ -620,7 +601,64 @@ def process_single_block(height):
             type_balances[script_type] += value_sat
             total_utxo += 1
             total_balance_sat += value_sat
-    
+
+    return {
+        'vout_rows': vout_rows,
+        'spend_rows': spend_rows,
+        'block_info': {
+            "block_height": height,
+            "block_hash": blockhash,
+            "block_timestamp": block_ts
+        },
+        'stats': {
+            'total_utxo': total_utxo,
+            'total_balance_sat': total_balance_sat,
+            'type_counts': dict(type_counts),
+            'type_balances': dict(type_balances)
+        }
+    }
+
+def get_last_processed_height():
+    try:
+        with db.get_db_cursor() as cur:
+            cur.execute("SELECT MAX(block_height) FROM block_log")
+            row = cur.fetchone()
+            return row[0] if row and row[0] is not None else 0
+    except Exception as e:
+        print(f"Error getting last processed height: {e}")
+        return 0
+
+def process_single_block(height):
+    """Process a single block and extract VOUTs (UTXOs) to database."""
+    if shutdown_requested:
+        return False
+
+    try:
+        blockhash = rpc_call("getblockhash", [height])
+        block = rpc_call("getblock", [blockhash, 3])
+    except Exception as e:
+        # Handle case where block is not yet available during sync
+        error_msg = str(e)
+        if "not found" in error_msg.lower() or "invalid" in error_msg.lower():
+            print(f"Block {height} not yet available (bitcoind may still be syncing)")
+            return False
+        print(f"Error reading block {height}: {e}")
+        return False
+
+    block_data = _extract_block_data(block, height, blockhash)
+    if block_data is None:
+        print(f"Shutdown requested while processing block {height}")
+        return False
+
+    vout_rows = block_data['vout_rows']
+    spend_rows = block_data['spend_rows']
+    block_ts = block_data['block_info']['block_timestamp']
+    stats = block_data['stats']
+    total_utxo = stats['total_utxo']
+    total_balance_sat = stats['total_balance_sat']
+    type_counts = stats['type_counts']
+    type_balances = stats['type_balances']
+
     try:
         db_start = time.time()
         print(f"[Block {height}] Starting database write...")
@@ -641,13 +679,13 @@ def process_single_block(height):
                 if vout_time > 0:
                     rows_per_sec = vout_count / vout_time
                     print(f"[Block {height}] Inserted {vout_count} UTXOs in {vout_time:.3f}s ({rows_per_sec:.0f} rows/sec)")
-            
+
             # Delete UTXOs that have been spent
             deleted_balance_sat = 0
             deleted_type_balances: Dict[str, int] = defaultdict(int)
             deleted_type_counts: Dict[str, int] = defaultdict(int)
             deleted_utxos = []
-            
+
             if spend_rows:
                 spend_start = time.time()
                 spend_count = len(spend_rows)
@@ -655,7 +693,7 @@ def process_single_block(height):
                 deleted_utxos = bulk_delete_utxos(cur, spend_rows)
                 # Update address_status to decrement balances for spent UTXOs
                 update_address_status_with_vin_balance(cur, deleted_utxos, height=height, block_ts=block_ts)
-                
+
                 # Track balance and counts for deleted UTXOs
                 for address, value_sat, script_type in deleted_utxos:
                     deleted_balance_sat += value_sat
@@ -665,24 +703,26 @@ def process_single_block(height):
                 if spend_time > 0:
                     rows_per_sec = spend_count / spend_time
                     print(f"[Block {height}] Deleted {spend_count} spent UTXOs in {spend_time:.3f}s ({rows_per_sec:.0f} rows/sec)")
-            
+
             # Insert block log entry
             bulk_insert_block_log_copy(cur, [(height, blockhash, block_ts)])
-            
+
             # Calculate net changes for stats (additions - deletions)
             net_total_utxo = total_utxo - sum(deleted_type_counts.values())
             net_total_balance_sat = total_balance_sat - deleted_balance_sat
-            net_type_counts = {k: type_counts[k] - deleted_type_counts.get(k, 0) for k in set(type_counts.keys()) | set(deleted_type_counts.keys())}
-            net_type_balances = {k: type_balances[k] - deleted_type_balances.get(k, 0) for k in set(type_balances.keys()) | set(deleted_type_balances.keys())}
+            all_type_keys = set(type_counts.keys()) | set(deleted_type_counts.keys())
+            net_type_counts = {k: type_counts.get(k, 0) - deleted_type_counts.get(k, 0) for k in all_type_keys}
+            all_balance_keys = set(type_balances.keys()) | set(deleted_type_balances.keys())
+            net_type_balances = {k: type_balances.get(k, 0) - deleted_type_balances.get(k, 0) for k in all_balance_keys}
             # Remove zero values
             net_type_counts = {k: v for k, v in net_type_counts.items() if v != 0}
             net_type_balances = {k: v for k, v in net_type_balances.items() if v != 0}
-            
+
             stats_batch = prepare_stats_batch(net_total_utxo, net_type_counts, net_total_balance_sat, net_type_balances)
             upsert_stats(cur, stats_batch)
-            
+
             # Update address_stats table for affected script types
-            # update_address_stats_incremental(cur, vout_rows, deleted_utxos)
+            update_address_stats_incremental(cur, vout_rows, deleted_utxos)
         db_time = time.time() - db_start
         print(f"[Block {height}] Database write completed in {db_time:.3f}s")
         print(f"Processed block {height} ({blockhash[:16]}...)")
@@ -699,90 +739,21 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
 
     def process_block_data(block, height, blockhash):
         """Process a single block's data and extract VOUTs (UTXOs) and VINs (spends)."""
-        block_time = block.get('time', 0)
-        block_ts = int(block_time * 1_000_000_000)
-
-        vout_rows = []
-        spend_rows = []
-        type_counts: Dict[str, int] = defaultdict(int)
-        type_balances: Dict[str, int] = defaultdict(int)
-        total_utxo = 0
-        total_balance_sat = 0
-
-        for tx in block.get("tx", []):
-            txid = tx.get("txid", "")
-            if shutdown_requested:
-                print(f"Shutdown requested while preparing chunk data for block {height}")
-                return {
-                    'vout_rows': [],
-                    'spend_rows': [],
-                    'block_info': None
-                }
-            
-            # Process vins (transaction inputs) to identify spent UTXOs for deletion
-            for vin_idx, vin in enumerate(tx.get("vin", [])):
-                # Skip coinbase transactions (they don't have valid txid/vout references)
-                if "coinbase" in vin:
-                    continue
-                
-                # Extract the UTXO being spent
-                spent_txid = vin.get("txid")
-                spent_vout = vin.get("vout")
-                
-                # Only process if we have valid references
-                if spent_txid and spent_vout is not None:
-                    spend_rows.append((
-                        txid,  # spent_by_txid
-                        vin_idx,  # spent_vin
-                        height,  # spent_block
-                        block_ts,  # spent_block_timestamp
-                        spent_txid,  # txid (the UTXO being spent)
-                        spent_vout  # vout (the UTXO being spent)
-                    ))
-            
-            # Process vouts (transaction outputs) to create new UTXOs
-            for idx, v in enumerate(tx.get("vout", [])):
-                spk = v.get("scriptPubKey", {})
-                address = address_from_vout(v)
-                value_btc = float(v.get("value", 0))
-                value_sat = int(value_btc * 100_000_000)
-                script_type = detect_script_type(spk)
-                vout_rows.append((
-                    txid,
-                    idx,
-                    address or None,
-                    value_sat,
-                    spk.get("hex", ""),
-                    script_type,
-                    height,
-                    block_ts
-                ))
-                type_counts[script_type] += 1
-                type_balances[script_type] += value_sat
-                total_utxo += 1
-                total_balance_sat += value_sat
-
-        return {
-            'vout_rows': vout_rows,
-            'spend_rows': spend_rows,
-            'block_info': {
-                "block_height": height,
-                "block_hash": blockhash,
-                "block_timestamp": block_ts
-            },
-            'stats': {
-                'total_utxo': total_utxo,
-                'total_balance_sat': total_balance_sat,
-                'type_counts': dict(type_counts),
-                'type_balances': dict(type_balances)
+        block_data = _extract_block_data(block, height, blockhash)
+        if block_data is None:
+            print(f"Shutdown requested while preparing chunk data for block {height}")
+            return {
+                'vout_rows': [],
+                'spend_rows': [],
+                'block_info': None
             }
-        }
+        return block_data
 
     for chunk_start in range(start_height, end_height + 1, chunk_size):
         if shutdown_requested:
             print("Shutdown requested during catch-up")
             break
-        
+
         chunk_end = min(chunk_start + chunk_size - 1, end_height)
         print(f"Processing chunk {chunk_start} → {chunk_end}")
 
@@ -853,7 +824,7 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                 if shutdown_requested:
                     print(f"Shutdown requested before writing chunk {chunk_start}-{chunk_end} to database")
                     break
-                    
+
                 if out_lists['vout_rows']:
                     vout_start = time.time()
                     vout_count = len(out_lists['vout_rows'])
@@ -869,21 +840,21 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                 deleted_balance_sat = 0
                 deleted_type_balances: Dict[str, int] = defaultdict(int)
                 deleted_type_counts: Dict[str, int] = defaultdict(int)
-                
+
                 if out_lists['spend_rows']:
                     spend_start = time.time()
                     spend_count = len(out_lists['spend_rows'])
                     print(f"[Chunk {chunk_start}-{chunk_end}] Deleting {spend_count} spent UTXOs...")
                     deleted_utxos = bulk_delete_utxos(cur, out_lists['spend_rows'])
-                    
+
                     # Extract max block height and timestamp from spend_rows for new address creation
                     # spend_rows structure: (spent_by_txid, spent_vin, spent_block, spent_block_timestamp, txid, vout)
                     max_height = max(row[2] for row in out_lists['spend_rows']) if out_lists['spend_rows'] else None
                     max_block_ts = max(row[3] for row in out_lists['spend_rows']) if out_lists['spend_rows'] else None
-                    
+
                     # Update address_status to decrement balances for spent UTXOs
                     update_address_status_with_vin_balance(cur, deleted_utxos, height=max_height, block_ts=max_block_ts)
-                    
+
                     # Track balance and counts for deleted UTXOs
                     for address, value_sat, script_type in deleted_utxos:
                         deleted_balance_sat += value_sat
@@ -902,16 +873,18 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
                     bulk_insert_block_log_copy(cur, block_vals)
                     block_log_time = time.time() - block_log_start
                     print(f"[Chunk {chunk_start}-{chunk_end}] Inserted {block_count} block_log entries in {block_log_time:.3f}s")
-                
+
                 # Calculate net changes for stats (additions - deletions)
                 net_total_utxo = chunk_total_utxo - sum(deleted_type_counts.values())
                 net_total_balance_sat = chunk_total_balance_sat - deleted_balance_sat
-                net_type_counts = {k: chunk_type_counts[k] - deleted_type_counts.get(k, 0) for k in set(chunk_type_counts.keys()) | set(deleted_type_counts.keys())}
-                net_type_balances = {k: chunk_type_balances[k] - deleted_type_balances.get(k, 0) for k in set(chunk_type_balances.keys()) | set(deleted_type_balances.keys())}
+                all_type_keys = set(chunk_type_counts.keys()) | set(deleted_type_counts.keys())
+                net_type_counts = {k: chunk_type_counts.get(k, 0) - deleted_type_counts.get(k, 0) for k in all_type_keys}
+                all_balance_keys = set(chunk_type_balances.keys()) | set(deleted_type_balances.keys())
+                net_type_balances = {k: chunk_type_balances.get(k, 0) - deleted_type_balances.get(k, 0) for k in all_balance_keys}
                 # Remove zero values
                 net_type_counts = {k: v for k, v in net_type_counts.items() if v != 0}
                 net_type_balances = {k: v for k, v in net_type_balances.items() if v != 0}
-                
+
                 stats_batch = prepare_stats_batch(net_total_utxo, net_type_counts, net_total_balance_sat, net_type_balances)
                 upsert_stats(cur, stats_batch)
 
@@ -921,7 +894,7 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
             print(f"Error writing chunk {chunk_start}-{chunk_end} to PostgreSQL: {e}")
         print(f"Saved and flushed chunk {chunk_start}–{chunk_end}")
 
-def read_utxo(height: int = 840_000,batch_size: int = 1_000_000):
+def read_utxo(height: int = 840_000, batch_size: int = 1_000_000):
     batch: List[tuple] = []
     type_counts: Dict[str, int] = defaultdict(int)
     total_utxo = 0
@@ -959,12 +932,12 @@ def read_utxo(height: int = 840_000,batch_size: int = 1_000_000):
 
                 if address == '':
                     continue
-                
+
                 row_tuple = (
                     txid, vout, address, amount, script_pub_key,
                     script_type, block_height, 0
                 )
-                
+
                 batch.append(row_tuple)
                 total_utxo += 1
 
@@ -983,7 +956,7 @@ def read_utxo(height: int = 840_000,batch_size: int = 1_000_000):
                     print(f"Inserted batch of {len(batch)} rows in {insert_time:.3f}s ({rows_per_sec:.0f} rows/sec). Total rows: {total_utxo}", file=sys.stderr)
                     batch = []
                     read_start = time.time()
-            
+
             except (ValueError, IndexError) as e:
                 print(f"Warning: Skipping line {line_num} due to parse error: {e}", file=sys.stderr)
                 continue
@@ -996,11 +969,11 @@ def read_utxo(height: int = 840_000,batch_size: int = 1_000_000):
         if len(batch) > 0:
             final_batch_start = time.time()
             execute_values(cur, insert_sql, batch, page_size=1000)
+            final_batch_time = time.time() - final_batch_start
+            if final_batch_time > 0:
+                rows_per_sec = len(batch) / final_batch_time
+                print(f"Inserted final batch of {len(batch)} rows in {final_batch_time:.3f}s ({rows_per_sec:.0f} rows/sec)", file=sys.stderr)
         upsert_stats(cur, stats_batch, absolute=True)
-        final_batch_time = time.time() - final_batch_start
-        if final_batch_time > 0:
-            rows_per_sec = len(batch) / final_batch_time
-            print(f"Inserted final batch of {len(batch)} rows in {final_batch_time:.3f}s ({rows_per_sec:.0f} rows/sec)", file=sys.stderr)
 
         index_start = time.time()
         # Check if primary key exists before adding it
@@ -1008,8 +981,8 @@ def read_utxo(height: int = 840_000,batch_size: int = 1_000_000):
             DO $$
             BEGIN
                 IF NOT EXISTS (
-                    SELECT 1 FROM pg_constraint 
-                    WHERE conname = 'utxos_pkey' 
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'utxos_pkey'
                     AND conrelid = 'utxos'::regclass
                 ) THEN
                     ALTER TABLE utxos ADD PRIMARY KEY (txid, vout);
@@ -1020,7 +993,7 @@ def read_utxo(height: int = 840_000,batch_size: int = 1_000_000):
         cur.execute("INSERT INTO block_log (block_height, block_hash, block_timestamp) VALUES (%s, %s, 0) ON CONFLICT DO NOTHING;", (height, '0' * 64))
         index_time = time.time() - index_start
         print(f"Created indexes and updated block_log in {index_time:.3f}s", file=sys.stderr)
-        
+
         cur.connection.commit()
 
     final_insert_time = time.time() - final_insert_start
@@ -1031,32 +1004,32 @@ def read_utxo(height: int = 840_000,batch_size: int = 1_000_000):
 
 def main():
     global shutdown_requested
-    
+
     # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    
+
     # Initialize database pool once at startup
     db.init_pool()
-    
+
     schema_init()
     last = get_last_processed_height()
-    
+
     # Initial catch-up: process from last_processed to current tip
     print(f"Starting indexer. Last processed: {last}")
     print(f"RPC Configuration: {RPC_HOST}:{RPC_PORT} (user: {RPC_USER})")
-    
+
     # Test RPC connection before proceeding
     print("\nTesting Bitcoin RPC connection...")
     if not test_rpc_connection():
         print("\nFatal: Cannot connect to Bitcoin RPC. Please fix the connection and try again.")
         db.shutdown_pool()
         sys.exit(1)
-    
+
     try:
         tip = rpc_call("getblockcount")
         start = max(0, last + 1)
-        
+
         print(f"Tippity top: {tip} | Starting from: {start}")
 
         if IS_RECALC:
@@ -1074,7 +1047,8 @@ def main():
             db.shutdown_pool()
             return
 
-        if start <= tip + 20:
+        epsilon = 100
+        if start + epsilon <= tip:
             print(f"Catching up: processing blocks {start} → {tip}")
             process_range(start, tip)
 
@@ -1082,7 +1056,7 @@ def main():
             print("Shutdown requested during catch-up, exiting...")
             db.shutdown_pool()
             sys.exit(0)
-        
+
         # Continuous polling loop
         print("Catch-up complete. Entering continuous sync mode...")
 
@@ -1094,8 +1068,8 @@ def main():
                 DO $$
                 BEGIN
                     IF NOT EXISTS (
-                        SELECT 1 FROM pg_constraint 
-                        WHERE conname = 'utxos_pkey' 
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname = 'utxos_pkey'
                         AND conrelid = 'utxos'::regclass
                     ) THEN
                         ALTER TABLE utxos ADD PRIMARY KEY (txid, vout);
@@ -1103,12 +1077,12 @@ def main():
                 END $$;
             """)
             cur.connection.commit()
-        
+
         while not shutdown_requested:
             try:
                 current_tip = rpc_call("getblockcount")
                 last_processed = get_last_processed_height()
-                
+
                 if last_processed < current_tip:
                     # Process new blocks one at a time
                     for height in range(last_processed + 1, current_tip + 1):
@@ -1126,20 +1100,20 @@ def main():
                                 time.sleep(1)
                             else:
                                 print(f"Failed to process block {height} after {MAX_RETRIES} retries")
-                
+
                 # Wait before next poll
                 time.sleep(POLL_INTERVAL)
-                
+
             except requests.exceptions.RequestException as e:
                 print(f"RPC connection error: {e}. Retrying in {RECONNECT_DELAY} seconds...")
                 time.sleep(RECONNECT_DELAY)
             except Exception as e:
                 print(f"Unexpected error in polling loop: {e}")
                 time.sleep(RECONNECT_DELAY)
-    
+
         print("Shutdown complete. Cleaning up...")
         db.shutdown_pool()
-        
+
     except KeyboardInterrupt:
         print("\nInterrupted by user")
     except Exception as e:
