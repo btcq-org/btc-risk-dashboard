@@ -344,7 +344,7 @@ def latest_addresses(limit: int = Query(150, ge=1, le=1000)):
                     script_pub_type,
                     reused,
                     created_block,
-                    created_block_timestamp,
+                    created_block_timestamp::text AS created_block_timestamp,
                     balance_sat
                 FROM address_status
                 ORDER BY created_block DESC, created_block_timestamp DESC
