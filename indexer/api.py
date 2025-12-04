@@ -333,59 +333,23 @@ def latest_blocks(limit: int = Query(20, ge=1, le=100)):
 
 @app.get("/latest/addresses")
 def latest_addresses(limit: int = Query(150, ge=1, le=1000)):
-    """Return the most recently seen addresses from latest UTXOs.
+    """Return the most recently seen addresses from address_status table.
     Uses created_block index for efficient querying.
     """
     try:
         with db.get_db_cursor(cursor_factory=RealDictCursor) as cur:
-            # Get a larger sample of latest UTXOs to ensure we have enough unique addresses
-            sample_size = limit * 10
             cur.execute("""
-                WITH latest_utxos AS (
-                    SELECT address, created_block, created_block_timestamp
-                    FROM utxos
-                    WHERE address IS NOT NULL AND address <> ''
-                    ORDER BY created_block DESC
-                    LIMIT %s
-                ),
-                unique_addresses AS (
-                    SELECT DISTINCT ON (address)
-                        address,
-                        created_block,
-                        created_block_timestamp
-                    FROM latest_utxos
-                    ORDER BY address, created_block DESC, created_block_timestamp DESC
-                    LIMIT %s
-                )
                 SELECT
-                    ua.address,
-                    ua.created_block,
-                    ua.created_block_timestamp,
-                    MIN(u.created_block) AS first_seen_block,
-                    MIN(u.created_block_timestamp) AS first_seen_block_timestamp,
-                    GREATEST(
-                        COALESCE(MAX(u.created_block), 0),
-                        COALESCE(MAX(u.spent_block), 0)
-                    ) AS last_seen_block,
-                    GREATEST(
-                        COALESCE(MAX(u.created_block_timestamp), 0),
-                        COALESCE(MAX(u.spent_block_timestamp), 0)
-                    ) AS last_seen_block_timestamp,
-                    SUM(CASE WHEN NOT u.spent THEN u.value_sat ELSE 0 END) AS balance_sat,
-                    COUNT(*) FILTER (WHERE NOT u.spent) AS utxo_count,
-                    COUNT(*) AS appearances,
-                    (SELECT script_pub_type 
-                     FROM utxos u2 
-                     WHERE u2.address = ua.address 
-                     ORDER BY CASE WHEN NOT u2.spent THEN 0 ELSE 1 END, 
-                              u2.created_block DESC, 
-                              u2.created_block_timestamp DESC 
-                     LIMIT 1) AS script_pub_type
-                FROM unique_addresses ua
-                JOIN utxos u ON u.address = ua.address
-                GROUP BY ua.address, ua.created_block, ua.created_block_timestamp
-                ORDER BY ua.created_block DESC, ua.created_block_timestamp DESC
-            """, (sample_size, limit))
+                    address,
+                    script_pub_type,
+                    reused,
+                    created_block,
+                    created_block_timestamp,
+                    balance_sat
+                FROM address_status
+                ORDER BY created_block DESC, created_block_timestamp DESC
+                LIMIT %s
+            """, (limit,))
             rows = cur.fetchall()
         return {"results": rows}
     except Exception as e:

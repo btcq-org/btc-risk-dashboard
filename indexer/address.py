@@ -371,31 +371,31 @@ def main():
     schema_init()
     
     # Step 1: Calculate addresses from UTXOs table
-    # calculate_addresses_from_utxos()
+    calculate_addresses_from_utxos()
     
     # Step 2: Get the latest block height and check for address reuse
-    # latest_block = get_latest_block_height()
-    # if latest_block is not None:
-    #     print(f"\nChecking address reuse in blocks from 1 to {latest_block}...")
-    #     # Check all blocks from the start (block 1) until latest block in chunks
-    #     chunk_size = 10
-    #     start_block = 924000
-    #     total_updated = 0
+    latest_block = get_latest_block_height()
+    if latest_block is not None:
+        print(f"\nChecking address reuse in blocks from 1 to {latest_block}...")
+        # Check all blocks from the start (block 1) until latest block in chunks
+        chunk_size = 10
+        start_block = 924000
+        total_updated = 0
         
-    #     while start_block <= latest_block:
-    #         # Calculate how many blocks to process in this chunk
-    #         num_blocks = min(chunk_size, latest_block - start_block + 1)
-    #         print(f"\nProcessing blocks {start_block} to {start_block + num_blocks - 1}...")
-    #         updated = check_address_reuse_from_blocks(start_block, num_blocks)
-    #         total_updated += updated
-    #         start_block += chunk_size
+        while start_block <= latest_block:
+            # Calculate how many blocks to process in this chunk
+            num_blocks = min(chunk_size, latest_block - start_block + 1)
+            print(f"\nProcessing blocks {start_block} to {start_block + num_blocks - 1}...")
+            updated = check_address_reuse_from_blocks(start_block, num_blocks)
+            total_updated += updated
+            start_block += chunk_size
         
-    #     print(f"\nTotal addresses marked as reused: {total_updated}")
-    # else:
-    #     print("No blocks found in block_log. Skipping reuse check.")
+        print(f"\nTotal addresses marked as reused: {total_updated}")
+    else:
+        print("No blocks found in block_log. Skipping reuse check.")
    
     # Step 3: Update address_stats after address_status is complete
-    # calculate_address_stats()
+    calculate_address_stats()
 
     get_biggest_and_oldest_address()
     
