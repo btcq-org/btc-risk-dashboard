@@ -7,12 +7,19 @@ import os
 import sys
 import struct
 import glob
+from io import BytesIO
 from typing import List, Dict, Any
 
-# Bitcoin block file magic bytes
-MAINNET_MAGIC = 0xf9beb4d9
-TESTNET_MAGIC = 0x0b110907
-REGTEST_MAGIC = 0xfabfb5da
+# Bitcoin block file magic bytes (as stored in file, little-endian)
+# When read as little-endian uint32, these become:
+MAINNET_MAGIC_LE = 0xd9b4bef9  # 0xf9beb4d9 stored as little-endian
+TESTNET_MAGIC_LE = 0x0709110b  # 0x0b110907 stored as little-endian
+REGTEST_MAGIC_LE = 0xdab5bffa  # 0xfabfb5da stored as little-endian
+
+# Also check the raw values (in case bytes are in different order)
+MAINNET_MAGIC_RAW = 0xf9beb4d9
+TESTNET_MAGIC_RAW = 0x0b110907
+REGTEST_MAGIC_RAW = 0xfabfb5da
 
 def read_varint(f) -> int:
     """Read Bitcoin CompactSize integer (varint) from file."""
@@ -27,7 +34,7 @@ def read_varint(f) -> int:
         return struct.unpack('<Q', f.read(8))[0]
 
 
-def read_tx(f) -> Dict[str, Any]:
+def read_tx(f, xor_key: bytes = None) -> Dict[str, Any]:
     """Read a transaction from the block file."""
     tx_start_pos = f.tell()
     
@@ -116,38 +123,112 @@ def read_tx(f) -> Dict[str, Any]:
     }
 
 
-def read_block(f) -> Dict[str, Any]:
-    """Read a block from the block file."""
-    # Magic bytes (4 bytes)
-    magic_bytes = struct.unpack('<I', f.read(4))[0]
+def detect_xor_key(magic_bytes_raw: bytes) -> bytes:
+    """
+    Detect XOR obfuscation key from magic bytes.
+    Bitcoin Core v28+ uses XOR obfuscation. The key can be derived from the obfuscated magic bytes.
+    """
+    # Expected magic bytes (mainnet, little-endian when read)
+    expected_magic = struct.pack('<I', MAINNET_MAGIC_LE)
     
-    if magic_bytes not in [MAINNET_MAGIC, TESTNET_MAGIC, REGTEST_MAGIC]:
+    # XOR the obfuscated bytes with expected to get the key
+    key = bytes(a ^ b for a, b in zip(magic_bytes_raw, expected_magic))
+    
+    # The key is typically 8 bytes, so we repeat it
+    # For the first 4 bytes, we have the key. For Bitcoin Core, the key is usually 8 bytes
+    # We'll use the first 4 bytes and repeat them, or try to detect the full 8-byte key
+    return key * 2  # Repeat to make 8 bytes
+
+
+def apply_xor(data: bytes, key: bytes) -> bytes:
+    """Apply XOR obfuscation/deobfuscation."""
+    if len(key) == 0:
+        return data
+    return bytes(data[i] ^ key[i % len(key)] for i in range(len(data)))
+
+
+def read_block(f, xor_key: bytes = None) -> Dict[str, Any]:
+    """Read a block from the block file."""
+    # Magic bytes (4 bytes, read as little-endian)
+    magic_bytes_raw = f.read(4)
+    if len(magic_bytes_raw) < 4:
         return None
     
+    # Check if obfuscated (Bitcoin Core v28+)
+    magic_bytes = struct.unpack('<I', magic_bytes_raw)[0]
+    magic_bytes_be = struct.unpack('>I', magic_bytes_raw)[0]
+    
+    # Check if this matches known magic bytes
+    valid_magic = (
+        magic_bytes in [MAINNET_MAGIC_LE, TESTNET_MAGIC_LE, REGTEST_MAGIC_LE] or
+        magic_bytes_be in [MAINNET_MAGIC_RAW, TESTNET_MAGIC_RAW, REGTEST_MAGIC_RAW]
+    )
+    
+    # If not valid and no XOR key provided, try to detect it
+    if not valid_magic and xor_key is None:
+        # Try to detect XOR key from magic bytes
+        detected_key = detect_xor_key(magic_bytes_raw)
+        # Try deobfuscating with detected key
+        deobfuscated_magic = apply_xor(magic_bytes_raw, detected_key[:4])
+        deobfuscated_value = struct.unpack('<I', deobfuscated_magic)[0]
+        
+        if deobfuscated_value in [MAINNET_MAGIC_LE, TESTNET_MAGIC_LE, REGTEST_MAGIC_LE]:
+            print(f"Detected XOR obfuscation (Bitcoin Core v28+). Key: {detected_key.hex()}")
+            xor_key = detected_key
+            # Re-read and deobfuscate
+            f.seek(-4, 1)  # Rewind 4 bytes
+            magic_bytes_raw = apply_xor(f.read(4), xor_key[:4])
+            magic_bytes = struct.unpack('<I', magic_bytes_raw)[0]
+        else:
+            print(f"Warning: Unexpected magic bytes: {magic_bytes} (0x{magic_bytes:08x})")
+            print(f"  Raw bytes: {magic_bytes_raw.hex()}")
+            print(f"  This might be obfuscated. Continuing anyway...")
+    
+    # Use XOR key if we have one
+    if xor_key is not None:
+        # We already deobfuscated the magic bytes above, continue with rest
+        pass
+    
     # Block size (4 bytes, little-endian)
-    block_size = struct.unpack('<I', f.read(4))[0]
+    block_size_raw = f.read(4)
+    if xor_key is not None:
+        block_size_raw = apply_xor(block_size_raw, xor_key[:4])
+    block_size = struct.unpack('<I', block_size_raw)[0]
     
     block_start = f.tell()
     
+    # Read entire block data
+    block_data = f.read(block_size)
+    if len(block_data) < block_size:
+        return None  # Not enough data
+    
+    # Deobfuscate entire block if XOR key is set
+    if xor_key is not None:
+        block_data = apply_xor(block_data, xor_key)
+    
+    # Parse from block_data using BytesIO
+    block_stream = BytesIO(block_data)
+    
     # Block header (80 bytes)
-    version = struct.unpack('<I', f.read(4))[0]
-    prev_block_hash = f.read(32)[::-1].hex()
-    merkle_root = f.read(32)[::-1].hex()
-    timestamp = struct.unpack('<I', f.read(4))[0]
-    bits = struct.unpack('<I', f.read(4))[0]
-    nonce = struct.unpack('<I', f.read(4))[0]
+    header_raw = block_stream.read(80)
+    version = struct.unpack('<I', header_raw[0:4])[0]
+    prev_block_hash = header_raw[4:36][::-1].hex()
+    merkle_root = header_raw[36:68][::-1].hex()
+    timestamp = struct.unpack('<I', header_raw[68:72])[0]
+    bits = struct.unpack('<I', header_raw[72:76])[0]
+    nonce = struct.unpack('<I', header_raw[76:80])[0]
     
     # Transaction count (varint)
-    tx_count = read_varint(f)
+    tx_count = read_varint(block_stream)
     
     # Read all transactions
     transactions = []
     for i in range(tx_count):
-        tx = read_tx(f)
+        tx = read_tx(block_stream)
         transactions.append(tx)
     
     block_end = f.tell()
-    actual_size = block_end - block_start
+    actual_size = block_size
     
     return {
         'magic': hex(magic_bytes),
@@ -188,7 +269,7 @@ def find_bitcoin_folder() -> str:
     return os.path.expanduser("~/.bitcoin/blocks")
 
 
-def read_blk_file(blk_file_path: str, max_blocks: int = 1) -> List[Dict[str, Any]]:
+def read_blk_file(blk_file_path: str, max_blocks: int = 1, xor_key: bytes = None) -> List[Dict[str, Any]]:
     """
     Read blocks from a single blk*.dat file.
     
@@ -217,7 +298,7 @@ def read_blk_file(blk_file_path: str, max_blocks: int = 1) -> List[Dict[str, Any
                 break
             
             try:
-                block = read_block(f)
+                block = read_block(f, xor_key)
                 if block is None:
                     # No more valid blocks
                     break
@@ -270,7 +351,8 @@ def main():
         print("=" * 70)
         print("BLOCK INFORMATION")
         print("=" * 70)
-        print(f"Magic: {block['magic']}")
+        magic_val = int(block['magic'], 16)
+        print(f"Magic: {block['magic']} (decimal: {magic_val})")
         print(f"Block Size: {block['block_size']:,} bytes")
         print(f"Version: {block['header']['version']}")
         print(f"Previous Block Hash: {block['header']['prev_block_hash']}")
