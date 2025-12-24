@@ -7,6 +7,7 @@ import os
 import sys
 import struct
 import glob
+import argparse
 from io import BytesIO
 from typing import List, Dict, Any, Tuple
 
@@ -403,7 +404,7 @@ def find_bitcoin_folder() -> str:
     return os.path.expanduser("~/.bitcoin/blocks")
 
 
-def read_blk_file(blk_file_path: str, max_blocks: int = 1, xor_key: bytes = None) -> Tuple[List[Dict[str, Any]], bytes]:
+def read_blk_file(blk_file_path: str, max_blocks: int = 1, xor_key: bytes = None, start_block_index: int = 0) -> Tuple[List[Dict[str, Any]], bytes]:
     """
     Read blocks from a single blk*.dat file.
     
@@ -411,6 +412,7 @@ def read_blk_file(blk_file_path: str, max_blocks: int = 1, xor_key: bytes = None
         blk_file_path: Path to the blk*.dat file
         max_blocks: Maximum number of blocks to read (default: 1)
         xor_key: Optional XOR key for deobfuscation (will be auto-detected if None)
+        start_block_index: Block index to start reading from (default: 0)
     
     Returns:
         Tuple of (list of block dictionaries, detected XOR key)
@@ -418,12 +420,14 @@ def read_blk_file(blk_file_path: str, max_blocks: int = 1, xor_key: bytes = None
     if not os.path.isfile(blk_file_path):
         raise FileNotFoundError(f"Block file not found: {blk_file_path}")
     
-    print(f"Reading block file: {blk_file_path}")
-    print(f"File size: {os.path.getsize(blk_file_path):,} bytes")
-    print()
+    if start_block_index == 0:
+        print(f"Reading block file: {blk_file_path}")
+        print(f"File size: {os.path.getsize(blk_file_path):,} bytes")
+        print()
     
     blocks = []
     detected_xor_key = xor_key
+    block_count = 0
     
     with open(blk_file_path, 'rb') as f:
         while len(blocks) < max_blocks:
@@ -448,7 +452,11 @@ def read_blk_file(blk_file_path: str, max_blocks: int = 1, xor_key: bytes = None
                     detected_xor_key = block['_xor_key']
                     print(f"Using detected XOR key for subsequent blocks: {detected_xor_key.hex()}")
                 
-                blocks.append(block)
+                # Only add blocks after we've skipped to the start_block_index
+                if block_count >= start_block_index:
+                    blocks.append(block)
+                
+                block_count += 1
             except struct.error as e:
                 # End of file or invalid data
                 print(f"Struct error at position {current_pos}: {e}")
@@ -464,13 +472,53 @@ def read_blk_file(blk_file_path: str, max_blocks: int = 1, xor_key: bytes = None
 
 def main():
     """Main entry point."""
+    parser = argparse.ArgumentParser(
+        description='Read and parse Bitcoin block files (.blk)',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python test_blk.py                    # Read first block from first file
+  python test_blk.py --block 0          # Read first block (index 0)
+  python test_blk.py --block 5          # Read 6th block (index 5)
+  python test_blk.py --file blk00001.dat --block 10  # Read block 10 from specific file
+  python test_blk.py --blocks-dir /path/to/blocks    # Specify blocks directory
+        """
+    )
+    parser.add_argument(
+        '--blocks-dir',
+        type=str,
+        help='Path to Bitcoin blocks directory (default: auto-detect)'
+    )
+    parser.add_argument(
+        '--file',
+        type=str,
+        help='Specific blk*.dat file to read (e.g., blk00000.dat). If not specified, uses first file.'
+    )
+    parser.add_argument(
+        '--block',
+        type=int,
+        default=0,
+        help='Block index to read from the file (0-based). Default: 0 (first block)'
+    )
+    parser.add_argument(
+        '--max-blocks',
+        type=int,
+        default=1,
+        help='Maximum number of blocks to read. Default: 1'
+    )
+    
+    args = parser.parse_args()
+    
     # Find Bitcoin folder
-    blocks_folder = find_bitcoin_folder()
+    if args.blocks_dir:
+        blocks_folder = args.blocks_dir
+    else:
+        blocks_folder = find_bitcoin_folder()
     
     if not os.path.isdir(blocks_folder):
         print(f"Error: Bitcoin blocks folder not found: {blocks_folder}")
         print("Please specify the path to your .bitcoin/blocks folder")
-        print("Usage: python test_blk.py [blocks_folder_path]")
+        print("Usage: python test_blk.py --blocks-dir /path/to/blocks")
         sys.exit(1)
     
     print(f"Bitcoin blocks folder: {blocks_folder}")
@@ -493,24 +541,42 @@ def main():
         print(f"Error: No blk*.dat files found in {blocks_folder}")
         sys.exit(1)
     
+    # Select which file to read
+    if args.file:
+        # Find the specified file
+        target_file = os.path.join(blocks_folder, args.file)
+        if not os.path.isfile(target_file):
+            print(f"Error: Block file not found: {target_file}")
+            sys.exit(1)
+        blk_file_path = target_file
+    else:
+        blk_file_path = blk_files[0]
+    
     print(f"Found {len(blk_files)} block file(s)")
-    print(f"Reading first block file: {os.path.basename(blk_files[0])}")
+    print(f"Reading block file: {os.path.basename(blk_file_path)}")
+    if args.block > 0:
+        print(f"Reading block at index: {args.block}")
     print("=" * 70)
     print()
     
-    # Read one block from the first file
+    # Read blocks from the file
     try:
-        blocks, detected_xor_key = read_blk_file(blk_files[0], max_blocks=1, xor_key=xor_key)
+        # Calculate how many blocks to read (need to read from start_block_index to start_block_index + max_blocks)
+        blocks_to_read = args.block + args.max_blocks
+        blocks, detected_xor_key = read_blk_file(blk_file_path, max_blocks=blocks_to_read, xor_key=xor_key, start_block_index=args.block)
         
         if not blocks:
             print("No blocks found in the file")
-            print("This might be due to:")
-            print("  1. XOR obfuscation not properly detected")
-            print("  2. File format issues")
-            print("  3. Empty or corrupted block file")
+
             return
         
-        block = blocks[0]
+        # Select which block to display
+        if args.block >= len(blocks):
+            print(f"Error: Block index {args.block} not found. File contains {len(blocks)} block(s).")
+            print(f"Valid block indices: 0 to {len(blocks) - 1}")
+            return
+        
+        block = blocks[0]  # blocks already contains only the requested blocks
         
         print("=" * 70)
         print("BLOCK INFORMATION")
