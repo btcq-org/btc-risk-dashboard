@@ -9,7 +9,18 @@ import struct
 import glob
 import argparse
 from io import BytesIO
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
+
+# Import script type detection utilities
+try:
+    from .utils import get_script_type
+    from pycoin.symbols.btc import network
+except ImportError:
+    # If running as standalone script, import from utils module
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from indexer.utils import get_script_type
+    from pycoin.symbols.btc import network
 
 # Bitcoin block file magic bytes (as stored in file, little-endian)
 # When read as little-endian uint32, these become:
@@ -86,10 +97,31 @@ def read_tx(f, xor_key: bytes = None) -> Dict[str, Any]:
         # Script (scriptPubKey)
         script = f.read(script_len)
         
+        script_hex = script.hex()
+        
+        # Detect script type and extract address
+        script_type = None
+        address = None
+        try:
+            # Try to get address from script
+            try:
+                address = network.address.for_script(script)
+                if address:
+                    address = str(address)
+            except Exception:
+                pass
+            
+            # Detect script type
+            script_type = get_script_type(script_hex, address or "")
+        except Exception as e:
+            script_type = "unknown"
+        
         outputs.append({
             'value': value,
             'script_len': script_len,
-            'script_hex': script.hex()
+            'script_hex': script_hex,
+            'script_type': script_type,
+            'address': address
         })
     
     # Witness data (if SegWit)
@@ -622,10 +654,23 @@ Examples:
             for i, out in enumerate(tx['outputs'][:3]):
                 print(f"    Output {i + 1}:")
                 print(f"      Value: {out['value']:,} satoshis ({out['value'] / 100000000:.8f} BTC)")
+                print(f"      Script Type: {out.get('script_type', 'unknown')}")
+                if out.get('address'):
+                    print(f"      Address: {out['address']}")
                 print(f"      Script Length: {out['script_len']} bytes")
                 print(f"      Script (hex): {out['script_hex'][:64]}..." if len(out['script_hex']) > 64 else f"      Script (hex): {out['script_hex']}")
             if len(tx['outputs']) > 3:
                 print(f"    ... and {len(tx['outputs']) - 3} more outputs")
+                
+            # Show script type summary
+            script_types = {}
+            for out in tx['outputs']:
+                script_type = out.get('script_type', 'unknown')
+                script_types[script_type] = script_types.get(script_type, 0) + 1
+            if script_types:
+                print(f"\n  Script Type Summary:")
+                for script_type, count in sorted(script_types.items()):
+                    print(f"    {script_type}: {count}")
         
         print()
         print("=" * 70)
