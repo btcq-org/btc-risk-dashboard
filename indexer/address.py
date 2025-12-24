@@ -3,9 +3,10 @@
 Address processing script - calculates addresses from UTXOs and checks for reuse.
 Runs address.sql to create tables, then:
 1. Calculates addresses from UTXOs table
-2. Fetches 1 block to check if addresses are reused (by looking at VINs)
-3. Updates address_status with reuse information
-4. Updates address_stats after address_status is complete
+2. Fetches blocks to check if addresses are reused (by looking at VINs)
+3. Tracks all P2PK addresses until the latest block
+4. Updates address_status with reuse information
+5. Updates address_stats after address_status is complete
 """
 import os
 from typing import Set
@@ -14,6 +15,7 @@ from pycoin.symbols.btc import network
 
 from . import db
 from .main import rpc_call, rpc_batch_call, RPCBatchError
+from .utils import detect_script_type, address_from_vout
 
 # ========================
 # CONFIGURATION
@@ -215,6 +217,153 @@ def check_address_reuse_from_blocks(start_block: int, num_blocks: int = 10):
     return updated_count
 
 
+def track_p2pk_addresses_from_blocks(start_block: int, end_block: int, chunk_size: int = 10):
+    """
+    Track all P2PK addresses by scanning blocks from start_block to end_block.
+    Extracts P2PK addresses from VOUTs and ensures they're recorded in address_status.
+    
+    Args:
+        start_block: The starting block height to scan
+        end_block: The ending block height to scan (inclusive)
+        chunk_size: Number of blocks to process in each batch (default: 10)
+    
+    Returns:
+        int: Number of P2PK addresses found and tracked
+    """
+    print(f"Tracking P2PK addresses from blocks {start_block} to {end_block}...")
+    
+    # Collect all P2PK addresses with their block information
+    p2pk_addresses = {}  # address -> (block_height, block_timestamp, script_pub_type)
+    
+    current_block = start_block
+    total_found = 0
+    
+    while current_block <= end_block:
+        # Calculate how many blocks to process in this chunk
+        num_blocks = min(chunk_size, end_block - current_block + 1)
+        block_heights = list(range(current_block, current_block + num_blocks))
+        
+        if not block_heights:
+            break
+        
+        hash_results = {}
+        block_results = {}
+        
+        try:
+            # Batch getblockhash calls for all blocks
+            hash_batch_requests = [("getblockhash", [height], height) for height in block_heights]
+            hash_results = rpc_batch_call(hash_batch_requests, description=f"getblockhash {current_block}-{current_block + num_blocks - 1}")
+            
+            # Batch getblock calls for all block hashes (using verbose=4 to get addresses in VOUTs)
+            block_batch_requests = [("getblock", [hash_results[height], 4], height) for height in block_heights if height in hash_results]
+            block_results = rpc_batch_call(block_batch_requests, description=f"getblock {current_block}-{current_block + num_blocks - 1}")
+            
+        except RPCBatchError as e:
+            print(f"RPC failure while fetching blocks {current_block}-{current_block + num_blocks - 1}: {e}")
+            # Continue with whatever blocks we successfully fetched
+            if not block_results:
+                current_block += num_blocks
+                continue
+        
+        # Process all successfully fetched blocks
+        for block_height in block_heights:
+            if block_height not in block_results:
+                print(f"Block {block_height} not found or failed to fetch. Skipping...")
+                continue
+            
+            block = block_results[block_height]
+            if block is None:
+                print(f"Block {block_height} returned None. Skipping...")
+                continue
+            
+            block_timestamp = block.get("time", 0)
+            
+            # Process all transactions in the block
+            for tx in block.get("tx", []):
+                # Process vouts (transaction outputs) to find P2PK addresses
+                for vout in tx.get("vout", []):
+                    script_pub_key = vout.get("scriptPubKey", {})
+                    if not script_pub_key:
+                        continue
+                    
+                    # Check if this is a P2PK script type
+                    script_type = detect_script_type(script_pub_key)
+                    if script_type != "P2PK":
+                        continue
+                    
+                    # Extract address from the scriptPubKey
+                    address = address_from_vout(vout)
+                    if not address:
+                        # For P2PK, we might need to derive address from script hex
+                        script_hex = script_pub_key.get("hex")
+                        if script_hex:
+                            try:
+                                script_bytes = bytes.fromhex(script_hex)
+                                paddress = network.address.for_script(script_bytes)
+                                if paddress:
+                                    address = str(paddress)
+                            except Exception:
+                                pass
+                    
+                    if address:
+                        # Track the earliest block where this address appears
+                        if address not in p2pk_addresses:
+                            p2pk_addresses[address] = (block_height, block_timestamp, script_type)
+                            total_found += 1
+                        else:
+                            # Update if this is an earlier block
+                            existing_block, _, _ = p2pk_addresses[address]
+                            if block_height < existing_block:
+                                p2pk_addresses[address] = (block_height, block_timestamp, script_type)
+        
+        current_block += num_blocks
+        
+        if total_found > 0 and len(p2pk_addresses) % 100 == 0:
+            print(f"Found {len(p2pk_addresses)} P2PK addresses so far...")
+    
+    if not p2pk_addresses:
+        print("No P2PK addresses found in the scanned blocks")
+        return 0
+    
+    print(f"Found {len(p2pk_addresses)} unique P2PK addresses across blocks {start_block}-{end_block}")
+    
+    # Insert/update address_status for P2PK addresses
+    with db.get_db_cursor() as cur:
+        # Prepare data for bulk insert
+        address_data = []
+        for address, (block_height, block_timestamp, script_type) in p2pk_addresses.items():
+            # Include all required fields: address, script_pub_type, reused, created_block, created_block_timestamp, balance_sat
+            address_data.append((address, script_type, False, block_height, block_timestamp, 0))
+        
+        # Use execute_values for efficient bulk insert
+        execute_values(
+            cur,
+            """
+            INSERT INTO address_status (
+                address,
+                script_pub_type,
+                reused,
+                created_block,
+                created_block_timestamp,
+                balance_sat
+            )
+            VALUES %s
+            ON CONFLICT (address) DO UPDATE SET
+                script_pub_type = EXCLUDED.script_pub_type,
+                created_block = LEAST(address_status.created_block, EXCLUDED.created_block),
+                created_block_timestamp = LEAST(address_status.created_block_timestamp, EXCLUDED.created_block_timestamp)
+            WHERE address_status.created_block > EXCLUDED.created_block
+            """,
+            address_data,
+            template=None,
+            page_size=DB_PAGE_ROWS
+        )
+        inserted_count = cur.rowcount
+    
+    print(f"Inserted/updated {inserted_count} P2PK addresses in address_status")
+    return len(p2pk_addresses)
+
+
 def calculate_address_stats():
     """
     After address_status is complete, update address_stats with aggregated statistics.
@@ -393,8 +542,20 @@ def main():
         print(f"\nTotal addresses marked as reused: {total_updated}")
     else:
         print("No blocks found in block_log. Skipping reuse check.")
+    
+    # Step 3: Track all P2PK addresses until the latest block
+    latest_block = get_latest_block_height()
+    if latest_block is not None:
+        print(f"\nTracking all P2PK addresses from block 1 to {latest_block}...")
+        # Track P2PK addresses from the beginning until latest block
+        chunk_size = 10
+        start_block = 1
+        total_p2pk = track_p2pk_addresses_from_blocks(start_block, latest_block, chunk_size)
+        print(f"\nTotal P2PK addresses tracked: {total_p2pk}")
+    else:
+        print("No blocks found in block_log. Skipping P2PK tracking.")
    
-    # Step 3: Update address_stats after address_status is complete
+    # Step 4: Update address_stats after address_status is complete
     calculate_address_stats()
 
     get_biggest_and_oldest_address()
