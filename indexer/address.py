@@ -219,7 +219,7 @@ def check_address_reuse_from_blocks(start_block: int, num_blocks: int = 10):
 
 def _insert_p2pk_addresses_to_db(p2pk_addresses: dict):
     """
-    Helper function to insert/update P2PK addresses in the database.
+    Helper function to insert/update P2PK addresses in the p2pk_status table.
     
     Args:
         p2pk_addresses: Dictionary mapping address -> (block_height, block_timestamp, script_pub_type)
@@ -237,11 +237,11 @@ def _insert_p2pk_addresses_to_db(p2pk_addresses: dict):
             # Include all required fields: address, script_pub_type, reused, created_block, created_block_timestamp, balance_sat
             address_data.append((address, script_type, False, block_height, block_timestamp, 0))
         
-        # Use execute_values for efficient bulk insert
+        # Use execute_values for efficient bulk insert into p2pk_status table
         execute_values(
             cur,
             """
-            INSERT INTO address_status (
+            INSERT INTO p2pk_status (
                 address,
                 script_pub_type,
                 reused,
@@ -252,9 +252,9 @@ def _insert_p2pk_addresses_to_db(p2pk_addresses: dict):
             VALUES %s
             ON CONFLICT (address) DO UPDATE SET
                 script_pub_type = EXCLUDED.script_pub_type,
-                created_block = LEAST(address_status.created_block, EXCLUDED.created_block),
-                created_block_timestamp = LEAST(address_status.created_block_timestamp, EXCLUDED.created_block_timestamp)
-            WHERE address_status.created_block > EXCLUDED.created_block
+                created_block = LEAST(p2pk_status.created_block, EXCLUDED.created_block),
+                created_block_timestamp = LEAST(p2pk_status.created_block_timestamp, EXCLUDED.created_block_timestamp)
+            WHERE p2pk_status.created_block > EXCLUDED.created_block
             """,
             address_data,
             template=None,
@@ -268,7 +268,7 @@ def _insert_p2pk_addresses_to_db(p2pk_addresses: dict):
 def track_p2pk_addresses_from_blocks(start_block: int, end_block: int, chunk_size: int = 10, insert_chunk_threshold: int = 1000):
     """
     Track all P2PK addresses by scanning blocks from start_block to end_block.
-    Extracts P2PK addresses from VOUTs and ensures they're recorded in address_status.
+    Extracts P2PK addresses from VOUTs and ensures they're recorded in p2pk_status table.
     Accumulates addresses in memory and only inserts to SQL after processing a specified number of chunks.
     
     Args:
@@ -373,10 +373,10 @@ def track_p2pk_addresses_from_blocks(start_block: int, end_block: int, chunk_siz
         
         # Insert to database after processing insert_chunk_threshold chunks
         if chunk_count >= insert_chunk_threshold:
-            print(f"Processed {chunk_count} chunks ({chunk_count * chunk_size} blocks), inserting {len(p2pk_addresses)} P2PK addresses to database...")
+            print(f"Processed {chunk_count} chunks ({chunk_count * chunk_size} blocks), inserting {len(p2pk_addresses)} P2PK addresses to p2pk_status table...")
             inserted = _insert_p2pk_addresses_to_db(p2pk_addresses)
             total_inserted += inserted
-            print(f"Inserted/updated {inserted} P2PK addresses. Total so far: {total_inserted}")
+            print(f"Inserted/updated {inserted} P2PK addresses in p2pk_status. Total so far: {total_inserted}")
             # Clear the dictionary to free memory
             p2pk_addresses = {}
             chunk_count = 0
@@ -385,16 +385,16 @@ def track_p2pk_addresses_from_blocks(start_block: int, end_block: int, chunk_siz
     
     # Insert any remaining addresses at the end
     if p2pk_addresses:
-        print(f"Inserting remaining {len(p2pk_addresses)} P2PK addresses to database...")
+        print(f"Inserting remaining {len(p2pk_addresses)} P2PK addresses to p2pk_status table...")
         inserted = _insert_p2pk_addresses_to_db(p2pk_addresses)
         total_inserted += inserted
-        print(f"Inserted/updated {inserted} P2PK addresses. Total: {total_inserted}")
+        print(f"Inserted/updated {inserted} P2PK addresses in p2pk_status. Total: {total_inserted}")
     
     if total_inserted == 0:
         print("No P2PK addresses found in the scanned blocks")
         return 0
     
-    print(f"Total P2PK addresses tracked and inserted: {total_inserted}")
+    print(f"Total P2PK addresses tracked and inserted into p2pk_status: {total_inserted}")
     return total_inserted
 
 

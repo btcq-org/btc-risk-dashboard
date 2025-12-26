@@ -25,3 +25,14 @@ CREATE TABLE IF NOT EXISTS address_global_stats (
     oldest_address TEXT,
     CHECK (id = 1)
 );
+
+-- P2PK status table - same structure as address_status but specifically for P2PK addresses
+CREATE TABLE IF NOT EXISTS p2pk_status (
+    address TEXT NOT NULL,
+    script_pub_type TEXT NOT NULL,
+    reused BOOLEAN NOT NULL,
+    created_block BIGINT NOT NULL,
+    created_block_timestamp BIGINT NOT NULL,
+    balance_sat BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (address)
+);
