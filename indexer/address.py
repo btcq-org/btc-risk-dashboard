@@ -220,9 +220,12 @@ def check_address_reuse_from_blocks(start_block: int, num_blocks: int = 10):
 def _insert_p2pk_addresses_to_db(p2pk_addresses: dict):
     """
     Helper function to insert/update P2PK addresses in the p2pk_status table.
+    All tracking (balance deltas, reuse status) is done in the p2pk_addresses dict.
     
     Args:
-        p2pk_addresses: Dictionary mapping address -> (block_height, block_timestamp, script_pub_type)
+        p2pk_addresses: Dictionary mapping address -> (block_height, block_timestamp, script_pub_type, balance_delta_sat, is_reused)
+                        balance_delta: positive from VOUTs, negative from VINs
+                        is_reused: True if address appears in any VIN
     
     Returns:
         int: Number of addresses inserted/updated
@@ -233,11 +236,23 @@ def _insert_p2pk_addresses_to_db(p2pk_addresses: dict):
     with db.get_db_cursor() as cur:
         # Prepare data for bulk insert
         address_data = []
-        for address, (block_height, block_timestamp, script_type) in p2pk_addresses.items():
+        for address, address_info in p2pk_addresses.items():
+            if len(address_info) == 5:
+                block_height, block_timestamp, script_type, balance_delta, is_reused = address_info
+            elif len(address_info) == 4:
+                # Backward compatibility: assume not reused
+                block_height, block_timestamp, script_type, balance_delta = address_info
+                is_reused = False
+            else:
+                # Backward compatibility: assume no balance delta and not reused
+                block_height, block_timestamp, script_type = address_info
+                balance_delta = 0
+                is_reused = False
+            
             # Include all required fields: address, script_pub_type, reused, created_block, created_block_timestamp, balance_sat
-            address_data.append((address, script_type, False, block_height, block_timestamp, 0))
+            address_data.append((address, script_type, is_reused, block_height, block_timestamp, balance_delta))
         
-        # Use execute_values for efficient bulk insert into p2pk_status table
+        # Single insert/update with all data
         execute_values(
             cur,
             """
@@ -252,9 +267,10 @@ def _insert_p2pk_addresses_to_db(p2pk_addresses: dict):
             VALUES %s
             ON CONFLICT (address) DO UPDATE SET
                 script_pub_type = EXCLUDED.script_pub_type,
+                reused = p2pk_status.reused OR EXCLUDED.reused,
                 created_block = LEAST(p2pk_status.created_block, EXCLUDED.created_block),
-                created_block_timestamp = LEAST(p2pk_status.created_block_timestamp, EXCLUDED.created_block_timestamp)
-            WHERE p2pk_status.created_block > EXCLUDED.created_block
+                created_block_timestamp = LEAST(p2pk_status.created_block_timestamp, EXCLUDED.created_block_timestamp),
+                balance_sat = p2pk_status.balance_sat + EXCLUDED.balance_sat
             """,
             address_data,
             template=None,
@@ -283,8 +299,11 @@ def track_p2pk_addresses_from_blocks(start_block: int, end_block: int, chunk_siz
     print(f"Tracking P2PK addresses from blocks {start_block} to {end_block}...")
     print(f"Will insert to database after every {insert_chunk_threshold} chunks ({insert_chunk_threshold * chunk_size} blocks)")
     
-    # Collect all P2PK addresses with their block information
-    p2pk_addresses = {}  # address -> (block_height, block_timestamp, script_pub_type)
+    # Collect all P2PK addresses with their block information, balance delta, and reuse status
+    # address -> (block_height, block_timestamp, script_pub_type, balance_delta_sat, is_reused)
+    # balance_delta: positive from VOUTs, negative from VINs
+    # is_reused: True if address appears in any VIN
+    p2pk_addresses = {}
     
     current_block = start_block
     chunk_count = 0
@@ -333,7 +352,57 @@ def track_p2pk_addresses_from_blocks(start_block: int, end_block: int, chunk_siz
             
             # Process all transactions in the block
             for tx in block.get("tx", []):
-                # Process vouts (transaction outputs) to find P2PK addresses
+                # First, process vins (transaction inputs) to check for reused P2PK addresses and track spent amounts
+                for vin in tx.get("vin", []):
+                    # Skip coinbase transactions
+                    if "coinbase" in vin:
+                        continue
+                    
+                    # With verbose=4, VIN contains prevout with address information
+                    prevout = vin.get("prevout", {})
+                    if prevout:
+                        script_pub_key = prevout.get("scriptPubKey", {})
+                        if script_pub_key:
+                            # Check if this is a P2PK script type
+                            script_type = detect_script_type(script_pub_key)
+                            if script_type == "P2PK":
+                                # Extract address from the prevout
+                                addresses = script_pub_key.get("addresses", [])
+                                address = script_pub_key.get("address")
+                                script_hex = script_pub_key.get("hex")
+                                
+                                p2pk_address = None
+                                if addresses and len(addresses) > 0:
+                                    p2pk_address = addresses[0]
+                                elif address:
+                                    p2pk_address = address
+                                elif script_hex:
+                                    try:
+                                        paddress = network.address.for_script(bytes.fromhex(script_hex))
+                                        if paddress:
+                                            p2pk_address = str(paddress)
+                                    except Exception:
+                                        pass
+                                
+                                if p2pk_address:
+                                    # Get the value from prevout (this is being spent, so negative)
+                                    prevout_value = prevout.get("value", 0)
+                                    # Convert from BTC to satoshis if needed
+                                    if isinstance(prevout_value, float):
+                                        prevout_value = int(prevout_value * 100000000)
+                                    
+                                    # Track in p2pk_addresses: subtract value (negative) and mark as reused
+                                    if p2pk_address not in p2pk_addresses:
+                                        # Address not seen before, initialize with negative value and reused=True
+                                        # We don't have block info from VIN, so use current block
+                                        p2pk_addresses[p2pk_address] = (block_height, block_timestamp, script_type, -prevout_value, True)
+                                    else:
+                                        # Address exists, subtract value and mark as reused
+                                        existing_block, existing_timestamp, existing_type, existing_balance, existing_reused = p2pk_addresses[p2pk_address]
+                                        new_balance = existing_balance - prevout_value
+                                        p2pk_addresses[p2pk_address] = (existing_block, existing_timestamp, existing_type, new_balance, True)
+                
+                # Process vouts (transaction outputs) to find P2PK addresses and track values
                 for vout in tx.get("vout", []):
                     script_pub_key = vout.get("scriptPubKey", {})
                     if not script_pub_key:
@@ -343,6 +412,12 @@ def track_p2pk_addresses_from_blocks(start_block: int, end_block: int, chunk_siz
                     script_type = detect_script_type(script_pub_key)
                     if script_type != "P2PK":
                         continue
+                    
+                    # Get the value from this output
+                    value_sat = vout.get("value", 0)
+                    # Convert from BTC to satoshis if needed (Bitcoin Core RPC returns BTC)
+                    if isinstance(value_sat, float):
+                        value_sat = int(value_sat * 100000000)
                     
                     # Extract address from the scriptPubKey
                     address = address_from_vout(vout)
@@ -359,21 +434,31 @@ def track_p2pk_addresses_from_blocks(start_block: int, end_block: int, chunk_siz
                                 pass
                     
                     if address:
-                        # Track the earliest block where this address appears
+                        # Track the earliest block where this address appears and add value (positive from VOUT)
                         if address not in p2pk_addresses:
-                            p2pk_addresses[address] = (block_height, block_timestamp, script_type)
+                            # New address, initialize with positive value and reused=False
+                            p2pk_addresses[address] = (block_height, block_timestamp, script_type, value_sat, False)
                         else:
-                            # Update if this is an earlier block
-                            existing_block, _, _ = p2pk_addresses[address]
+                            # Address exists, add value and preserve reused status
+                            existing_block, existing_timestamp, existing_type, existing_balance, existing_reused = p2pk_addresses[address]
+                            new_balance = existing_balance + value_sat
                             if block_height < existing_block:
-                                p2pk_addresses[address] = (block_height, block_timestamp, script_type)
+                                # Earlier block found, update block info
+                                p2pk_addresses[address] = (block_height, block_timestamp, script_type, new_balance, existing_reused)
+                            else:
+                                # Same or later block, just update balance
+                                p2pk_addresses[address] = (existing_block, existing_timestamp, existing_type, new_balance, existing_reused)
         
         current_block += num_blocks
         chunk_count += 1
         
         # Insert to database after processing insert_chunk_threshold chunks
         if chunk_count >= insert_chunk_threshold:
+            # Calculate stats for logging
+            total_balance_delta = sum(info[3] if len(info) >= 4 else 0 for info in p2pk_addresses.values())
+            reused_count = sum(1 for info in p2pk_addresses.values() if len(info) >= 5 and info[4])
             print(f"Processed {chunk_count} chunks ({chunk_count * chunk_size} blocks), inserting {len(p2pk_addresses)} P2PK addresses to p2pk_status table...")
+            print(f"  Balance delta: {total_balance_delta:+,} satoshis, Reused addresses: {reused_count}")
             inserted = _insert_p2pk_addresses_to_db(p2pk_addresses)
             total_inserted += inserted
             print(f"Inserted/updated {inserted} P2PK addresses in p2pk_status. Total so far: {total_inserted}")
@@ -385,7 +470,10 @@ def track_p2pk_addresses_from_blocks(start_block: int, end_block: int, chunk_siz
     
     # Insert any remaining addresses at the end
     if p2pk_addresses:
+        total_balance_delta = sum(info[3] if len(info) >= 4 else 0 for info in p2pk_addresses.values())
+        reused_count = sum(1 for info in p2pk_addresses.values() if len(info) >= 5 and info[4])
         print(f"Inserting remaining {len(p2pk_addresses)} P2PK addresses to p2pk_status table...")
+        print(f"  Balance delta: {total_balance_delta:+,} satoshis, Reused addresses: {reused_count}")
         inserted = _insert_p2pk_addresses_to_db(p2pk_addresses)
         total_inserted += inserted
         print(f"Inserted/updated {inserted} P2PK addresses in p2pk_status. Total: {total_inserted}")
