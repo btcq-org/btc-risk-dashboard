@@ -13,7 +13,7 @@ services:
       - "-txindex=0"
       - "-rpcport=18332"
       # - "-stopatheight=100000"
-      - "-connect=0"
+      # - "-connect=0"
       # - "-maxconnections=0"
       # - "-daemon"
     ports:
