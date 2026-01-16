@@ -731,7 +731,7 @@ def process_single_block(height):
         print(f"Error writing block {height} to PostgreSQL: {e}")
         return False
 
-def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
+def process_range_legacy(start_height, end_height, chunk_size=CHUNK_SIZE):
     if start_height > end_height:
         return
 
@@ -1050,7 +1050,32 @@ def main():
         epsilon = 100
         if start + epsilon <= tip:
             print(f"Catching up: processing blocks {start} → {tip}")
-            process_range(start, tip)
+            
+            # Choose block reader based on configuration
+            from .block_reader import RPCBlockReader, BLKFileReader
+            from .range_processor import process_range
+            
+            BLOCK_SOURCE = os.getenv('BLOCK_SOURCE', 'rpc').lower()  # 'rpc' or 'blk'
+            
+            if BLOCK_SOURCE == 'blk':
+                # Use BLK file reader
+                blocks_dir = os.getenv('BLOCKS_DIR', None)
+                block_reader = BLKFileReader(
+                    blocks_dir=blocks_dir,
+                    rpc_call=rpc_call,
+                    rpc_batch_call=rpc_batch_call
+                )
+                print("Using BLK file reader for block fetching")
+            else:
+                # Use RPC reader (default)
+                block_reader = RPCBlockReader(
+                    rpc_batch_call=rpc_batch_call,
+                    rpc_call=rpc_call
+                )
+                print("Using RPC reader for block fetching")
+            
+            # Process range with selected block reader
+            process_range(start, tip, block_reader, chunk_size=CHUNK_SIZE, shutdown_check=lambda: shutdown_requested)
 
         if shutdown_requested:
             print("Shutdown requested during catch-up, exiting...")
