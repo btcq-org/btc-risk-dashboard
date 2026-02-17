@@ -1,17 +1,17 @@
 """Shared database connection handling for quantum-at-risk indexer."""
 
-import os
 from contextlib import contextmanager
 import psycopg2
 from psycopg2.pool import ThreadedConnectionPool
 from psycopg2.extras import RealDictCursor, execute_values
 
-# DB connection settings from env with defaults
-DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
-DB_PORT = int(os.getenv("DB_PORT", "5432"))
-DB_NAME = os.getenv("DB_NAME", "postgres")
-DB_USER = os.getenv("DB_USER", "indexer")
-DB_PASS = os.getenv("DB_PASS", "password")
+from . import config
+
+DB_HOST = config.DB_HOST
+DB_PORT = config.DB_PORT
+DB_NAME = config.DB_NAME
+DB_USER = config.DB_USER
+DB_PASS = config.DB_PASS
 
 # Connection pool (min=1, max=20 connections)
 _pool = None

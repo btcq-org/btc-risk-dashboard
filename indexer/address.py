@@ -13,14 +13,12 @@ from typing import Set
 from psycopg2.extras import execute_values, RealDictCursor
 from pycoin.symbols.btc import network
 
+from . import config
 from . import db
 from .main import rpc_call, rpc_batch_call, RPCBatchError
 from .utils import detect_script_type, address_from_vout
 
-# ========================
-# CONFIGURATION
-# ========================
-DB_PAGE_ROWS = int(os.getenv('DB_PAGE_ROWS', '1000'))
+DB_PAGE_ROWS = config.DB_PAGE_ROWS
 
 
 def schema_init():

@@ -18,30 +18,29 @@ from collections import defaultdict
 from typing import Dict, List
 from psycopg2.extras import execute_values
 
+from . import config
 from . import db
 from .utils import detect_script_type, address_from_vout, get_script_type
 
 # ========================
-# CONFIGURATION
+# CONFIGURATION (from indexer.config)
 # ========================
-NETWORK = 'testnet'
-RPC_USER = os.getenv('RPC_USER', 'admin')
-RPC_PASSWORD = os.getenv('RPC_PASSWORD', 'pass')
-RPC_HOST = os.getenv('RPC_HOST', '127.0.0.1')
-RPC_PORT = int(os.getenv('RPC_PORT', '18332'))
-RPC_URL = f"http://{RPC_HOST}:{RPC_PORT}/"
+NETWORK = config.NETWORK
+RPC_USER = config.RPC_USER
+RPC_PASSWORD = config.RPC_PASSWORD
+RPC_HOST = config.RPC_HOST
+RPC_PORT = config.RPC_PORT
+RPC_URL = config.RPC_URL
 
 SelectParams(NETWORK)
 
-POLL_INTERVAL = 1.0                       # seconds between checking for new blocks
-RECONNECT_DELAY = 5.0                     # seconds to wait after connection error
-
-# Tuning knobs (can be overridden by env)
-CHUNK_SIZE = int(os.getenv('CHUNK_SIZE', '10'))                    # blocks per catch-up chunk
-MAX_RETRIES = int(os.getenv('MAX_RETRIES', '5'))                    # max retries for failed RPC
-DB_PAGE_ROWS = int(os.getenv('DB_PAGE_ROWS', '1000'))              # rows per DB insert page
-IS_UTXO = bool(int(os.getenv('IS_UTXO', '0')))                      # whether indexing UTXOs (True) or TXOs (False)
-IS_RECALC = bool(int(os.getenv('IS_RECALC', '0')))
+POLL_INTERVAL = config.POLL_INTERVAL
+RECONNECT_DELAY = config.RECONNECT_DELAY
+CHUNK_SIZE = config.CHUNK_SIZE
+MAX_RETRIES = config.MAX_RETRIES
+DB_PAGE_ROWS = config.DB_PAGE_ROWS
+IS_UTXO = config.IS_UTXO
+IS_RECALC = config.IS_RECALC
 
 # ========================
 # RPC UTILS
@@ -1055,11 +1054,9 @@ def main():
             from .block_reader import RPCBlockReader, BLKFileReader
             from .range_processor import process_range
             
-            BLOCK_SOURCE = os.getenv('BLOCK_SOURCE', 'rpc').lower()  # 'rpc' or 'blk'
-            
+            BLOCK_SOURCE = config.BLOCK_SOURCE
             if BLOCK_SOURCE == 'blk':
-                # Use BLK file reader
-                blocks_dir = os.getenv('BLOCKS_DIR', None)
+                blocks_dir = config.BLOCKS_DIR
                 block_reader = BLKFileReader(
                     blocks_dir=blocks_dir,
                     rpc_call=rpc_call,
