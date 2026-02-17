@@ -73,7 +73,7 @@ def read_tx(f, xor_key: bytes = None) -> Dict[str, Any]:
         prev_output_index = struct.unpack('<I', f.read(4))[0]
         # Script length (varint)
         script_len = read_varint(f)
-        # Script
+        # Script (scriptSig) - required for correct txid serialization
         script = f.read(script_len)
         # Sequence (4 bytes)
         sequence = struct.unpack('<I', f.read(4))[0]
@@ -82,6 +82,7 @@ def read_tx(f, xor_key: bytes = None) -> Dict[str, Any]:
             'prev_tx_hash': prev_tx_hash,
             'prev_output_index': prev_output_index,
             'script_len': script_len,
+            'script_hex': script.hex(),
             'sequence': sequence
         })
     

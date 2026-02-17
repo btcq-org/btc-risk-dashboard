@@ -192,8 +192,22 @@ def serialize_tx_for_txid(tx: Dict[str, Any]) -> bytes:
         tx_bytes.write(prev_tx_hash_bytes)
         # Previous output index (4 bytes, little-endian)
         tx_bytes.write(struct.pack('<I', inp.get('prev_output_index', 0)))
-        # Script length (varint) - we don't have the actual script, use empty
-        tx_bytes.write(bytes([0]))  # Empty script
+        # Script length (varint) and script (scriptSig) - required for correct txid
+        script_hex = inp.get('script_hex', '')
+        script_bytes = bytes.fromhex(script_hex) if script_hex else b''
+        script_len = len(script_bytes)
+        if script_len < 0xfd:
+            tx_bytes.write(bytes([script_len]))
+        elif script_len <= 0xffff:
+            tx_bytes.write(bytes([0xfd]))
+            tx_bytes.write(struct.pack('<H', script_len))
+        elif script_len <= 0xffffffff:
+            tx_bytes.write(bytes([0xfe]))
+            tx_bytes.write(struct.pack('<I', script_len))
+        else:
+            tx_bytes.write(bytes([0xff]))
+            tx_bytes.write(struct.pack('<Q', script_len))
+        tx_bytes.write(script_bytes)
         # Sequence (4 bytes)
         tx_bytes.write(struct.pack('<I', inp.get('sequence', 0)))
     
@@ -287,7 +301,7 @@ def convert_blk_to_rpc_format(blk_block: Dict[str, Any], height: int) -> Dict[st
             
             if is_coinbase:
                 vin = {
-                    'coinbase': '',  # Coinbase script (we don't store it in BLK format)
+                    'coinbase': inp.get('script_hex', ''),
                     'sequence': inp.get('sequence', 0)
                 }
             else:
@@ -295,7 +309,7 @@ def convert_blk_to_rpc_format(blk_block: Dict[str, Any], height: int) -> Dict[st
                     'txid': prev_tx_hash,
                     'vout': inp.get('prev_output_index', 0),
                     'scriptSig': {
-                        'hex': ''  # We don't store scriptSig in BLK format
+                        'hex': inp.get('script_hex', '')
                     },
                     'sequence': inp.get('sequence', 0)
                 }
