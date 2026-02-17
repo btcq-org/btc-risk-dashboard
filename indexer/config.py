@@ -19,9 +19,9 @@ RPC_URL = f"http://{RPC_HOST}:{RPC_PORT}/"
 # Block source: 'rpc' (Bitcoin Core RPC) or 'blk' (read from blk*.dat files)
 BLOCK_SOURCE = os.getenv("BLOCK_SOURCE", "rpc").lower()
 # Path to blocks directory (only when BLOCK_SOURCE=blk). e.g. /path/to/data-bitcoin/blocks
-BLOCKS_DIR = os.getenv("BLOCKS_DIR")
+BLOCKS_DIR = os.getenv("BLOCKS_DIR", "~/data-bitcoin/blocks")
 # Optional: Bitcoin data dir for auto-detecting blocks (e.g. ~/.bitcoin or /path/to/data-bitcoin)
-BITCOIN_DIR = os.getenv("BITCOIN_DIR")
+BITCOIN_DIR = os.getenv("BITCOIN_DIR", "~/data-bitcoin")
 
 # ---------------------------------------------------------------------------
 # Database (PostgreSQL / TimescaleDB)

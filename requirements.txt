@@ -1,0 +1,18 @@
+# Bitcoin / blockchain
+python-bitcoinlib>=0.12.0
+pycoin>=0.92
+
+# HTTP
+requests>=2.28.0
+
+# Database
+psycopg2-binary>=2.9.0
+
+# API (optional, for indexer.api)
+fastapi>=0.100.0
+uvicorn[standard]>=0.22.0
+
+# Testing
+pytest>=7.0.0
+
+# Optional: indexer.read_blocks.py uses blockchain-parser (conflicts with python-bitcoinlib>=0.12)

@@ -488,10 +488,7 @@ class BLKFileReader:
         
         try:
             hash_batch_requests = [("getblockhash", [height], height) for height in heights]
-            hash_results = self.rpc_batch_call(
-                hash_batch_requests,
-                description=f"getblockhash for BLK reader ({len(heights)} blocks)"
-            )
+            hash_results = self.rpc_batch_call(hash_batch_requests)
         except Exception as e:
             raise RuntimeError(f"Failed to get block hashes via RPC: {e}")
         
