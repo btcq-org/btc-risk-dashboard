@@ -20,6 +20,7 @@ from psycopg2.extras import execute_values
 
 from . import config
 from . import db
+from .block_data import _extract_block_data as _extract_block_data_core
 from .utils import detect_script_type, address_from_vout, get_script_type
 
 # ========================
@@ -536,86 +537,8 @@ def signal_handler(signum, frame):
 # Range processing
 # ========================
 def _extract_block_data(block, height, blockhash):
-    """
-    Extract VOUTs (UTXOs) and VINs (spends) from a block.
-    Returns: tuple of (vout_rows, spend_rows, stats_dict) or None if shutdown requested.
-    """
-    if shutdown_requested:
-        return None
-
-    block_time = block.get('time', 0)
-    block_ts = int(block_time * 1_000_000_000)
-
-    vout_rows = []
-    spend_rows = []
-    type_counts: Dict[str, int] = defaultdict(int)
-    type_balances: Dict[str, int] = defaultdict(int)
-    total_utxo = 0
-    total_balance_sat = 0
-
-    for tx in block.get("tx", []):
-        txid = tx.get("txid", "")
-        if shutdown_requested:
-            return None
-
-        # Process vins (transaction inputs) to identify spent UTXOs for deletion
-        for vin_idx, vin in enumerate(tx.get("vin", [])):
-            # Skip coinbase transactions (they don't have valid txid/vout references)
-            if "coinbase" in vin:
-                continue
-
-            # Extract the UTXO being spent
-            spent_txid = vin.get("txid")
-            spent_vout = vin.get("vout")
-
-            # Only process if we have valid references
-            if spent_txid and spent_vout is not None:
-                spend_rows.append((
-                    txid,  # spent_by_txid
-                    vin_idx,  # spent_vin
-                    height,  # spent_block
-                    block_ts,  # spent_block_timestamp
-                    spent_txid,  # txid (the UTXO being spent)
-                    spent_vout  # vout (the UTXO being spent)
-                ))
-
-        # Process vouts (transaction outputs) to create new UTXOs
-        for idx, v in enumerate(tx.get("vout", [])):
-            spk = v.get("scriptPubKey", {})
-            address = address_from_vout(v)
-            value_btc = float(v.get("value", 0))
-            value_sat = int(value_btc * 100_000_000)
-            script_type = detect_script_type(spk)
-            vout_rows.append((
-                txid,
-                idx,
-                address or None,
-                value_sat,
-                spk.get("hex", ""),
-                script_type,
-                height,
-                block_ts
-            ))
-            type_counts[script_type] += 1
-            type_balances[script_type] += value_sat
-            total_utxo += 1
-            total_balance_sat += value_sat
-
-    return {
-        'vout_rows': vout_rows,
-        'spend_rows': spend_rows,
-        'block_info': {
-            "block_height": height,
-            "block_hash": blockhash,
-            "block_timestamp": block_ts
-        },
-        'stats': {
-            'total_utxo': total_utxo,
-            'total_balance_sat': total_balance_sat,
-            'type_counts': dict(type_counts),
-            'type_balances': dict(type_balances)
-        }
-    }
+    """Extract VOUTs and VINs from a block (uses shared block_data with shutdown check)."""
+    return _extract_block_data_core(block, height, blockhash, shutdown_check=lambda: shutdown_requested)
 
 def get_last_processed_height():
     try:

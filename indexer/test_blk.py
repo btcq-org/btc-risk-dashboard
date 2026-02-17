@@ -424,10 +424,10 @@ def find_bitcoin_folder() -> str:
         os.path.expanduser("~/.bitcoin/regtest/blocks"),
     ]
     
-    # Check environment variable
+    # Check environment variable (expand ~ so path is valid for isdir)
     bitcoin_dir = os.getenv('BITCOIN_DIR')
     if bitcoin_dir:
-        possible_paths.insert(0, os.path.join(bitcoin_dir, "blocks"))
+        possible_paths.insert(0, os.path.join(os.path.expanduser(bitcoin_dir), "blocks"))
     
     for path in possible_paths:
         if os.path.isdir(path):
