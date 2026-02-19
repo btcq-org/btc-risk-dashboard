@@ -1,6 +1,6 @@
 services:
   bitcoin:
-    image: bitcoin/bitcoin:latest
+    image: bitcoin/bitcoin:30.2
     container_name: btc-node
     restart: unless-stopped
     volumes:

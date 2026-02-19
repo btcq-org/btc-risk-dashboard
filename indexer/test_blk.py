@@ -220,6 +220,7 @@ def read_block(f, xor_key: bytes = None, shutdown_check: Optional[Callable[[], b
     if shutdown_check is not None and shutdown_check():
         raise ShutdownRequested()
     # Magic bytes (4 bytes, read as little-endian)
+    magic_pos = f.tell()  # XOR uses file offset (Bitcoin Core v28+)
     magic_bytes_raw = f.read(4)
     if len(magic_bytes_raw) < 4:
         return None
@@ -235,10 +236,9 @@ def read_block(f, xor_key: bytes = None, shutdown_check: Optional[Callable[[], b
     )
     
     # Magic bytes might also be obfuscated - try deobfuscating if we have a key
-    # Magic bytes are at file offset 0
+    # Use actual file offset so multi-block files deobfuscate correctly
     if xor_key is not None and not valid_magic:
-        # Try deobfuscating magic bytes with offset 0
-        deobfuscated_magic = apply_xor(magic_bytes_raw, xor_key, offset=0)
+        deobfuscated_magic = apply_xor(magic_bytes_raw, xor_key, offset=magic_pos)
         deobfuscated_value = struct.unpack('<I', deobfuscated_magic)[0]
         if deobfuscated_value in [MAINNET_MAGIC_LE, TESTNET_MAGIC_LE, REGTEST_MAGIC_LE]:
             magic_bytes_raw = deobfuscated_magic
@@ -304,22 +304,22 @@ def read_block(f, xor_key: bytes = None, shutdown_check: Optional[Callable[[], b
         pass
     
     # Block size (4 bytes, little-endian)
-    # The block size is at file offset 4, so it needs to be XORed with offset 4
+    size_pos = f.tell()  # XOR uses file offset (correct for 2nd, 3rd, ... block in file)
     block_size_raw = f.read(4)
     if len(block_size_raw) < 4:
         return None
     
     # Deobfuscate block size if XOR key is available
-    # Block size is at file position 4, so use offset 4 for XOR
     if xor_key is not None:
-        block_size_raw = apply_xor(block_size_raw, xor_key, offset=4)
+        block_size_raw = apply_xor(block_size_raw, xor_key, offset=size_pos)
     
     block_size = struct.unpack('<I', block_size_raw)[0]
     
-    # Sanity check on block size
-    if block_size == 0 or block_size > 10 * 1024 * 1024:  # Max 10MB block
-        print(f"Warning: Invalid block size: {block_size} bytes")
-        print(f"  Raw bytes: {block_size_raw.hex()}")
+    # Sanity check: Bitcoin blocks are capped by 4M weight (~1–2 MB serialized). Values
+    # above a few MB usually mean obfuscated bytes (XOR not applied) or wrong file position.
+    if block_size == 0 or block_size > 4 * 1024 * 1024:  # 4 MB
+        print(f"[BLK] Warning: Invalid block size: {block_size} bytes (raw: {block_size_raw.hex()})")
+        print(f"[BLK] Likely obfuscation or wrong position; skipping rest of file.")
         return None
     
     block_start = f.tell()
@@ -330,11 +330,9 @@ def read_block(f, xor_key: bytes = None, shutdown_check: Optional[Callable[[], b
         print(f"Warning: Not enough data. Expected {block_size} bytes, got {len(block_data)} bytes")
         return None  # Not enough data
     
-    # Deobfuscate entire block if XOR key is set
-    # XOR obfuscation starts at offset 8 (after magic + block_size)
-    # So we need to account for offset 8 when applying XOR
+    # Deobfuscate entire block if XOR key is set (use file offset for multi-block files)
     if xor_key is not None:
-        block_data = apply_xor(block_data, xor_key, offset=8)
+        block_data = apply_xor(block_data, xor_key, offset=block_start)
     
     # Parse from block_data using BytesIO
     block_stream = BytesIO(block_data)
@@ -486,9 +484,9 @@ def read_blk_file(blk_file_path: str, max_blocks: int = 1, xor_key: bytes = None
                 if block is None:
                     # No more valid blocks
                     if current_pos == 0:
-                        print(f"No blocks found at start of file (position {current_pos})")
+                        print(f"[BLK] No blocks found at start of file (position {current_pos})")
                     else:
-                        print(f"No more blocks found at position {current_pos}")
+                        print(f"[BLK] No more blocks found at position {current_pos}")
                     break
                 
                 # If we detected a new XOR key, save it for subsequent blocks

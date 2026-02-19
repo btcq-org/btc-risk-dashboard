@@ -463,6 +463,8 @@ class BLKFileReader:
                     if block_hash.lower() == target_hash.lower():
                         return blk_block
                         
+            except ShutdownRequested:
+                raise
             except Exception as e:
                 print(f"Error scanning {blk_file} for block {target_hash}: {e}")
                 continue
