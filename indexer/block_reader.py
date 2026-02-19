@@ -416,12 +416,13 @@ class BLKFileReader:
             self._blk_files = sorted(glob.glob(os.path.join(self.blocks_dir, "blk*.dat")))
         return self._blk_files
     
-    def _find_block_by_hash(self, target_hash: str) -> Optional[Dict[str, Any]]:
+    def _find_block_by_hash(self, target_hash: str, target_height: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """
         Find a block in BLK files by matching block hash.
         
         Args:
             target_hash: Block hash to find (hex string, normal order)
+            target_height: Block height we're searching for (for logging)
         
         Returns:
             Block dict in BLK format, or None if not found
@@ -436,7 +437,8 @@ class BLKFileReader:
                     max_blocks=10000,  # Read in batches
                     xor_key=self.xor_key,
                     start_block_index=0,
-                    shutdown_check=self.shutdown_check
+                    shutdown_check=self.shutdown_check,
+                    target_height=target_height
                 )
                 
                 for blk_block in blocks:
@@ -485,8 +487,10 @@ class BLKFileReader:
         if not heights:
             return {}
         
+        height_min, height_max = min(heights), max(heights)
+        print(f"BLK: reading heights {height_min}-{height_max} ({len(heights)} blocks)")
         result = {}
-        
+
         # Step 1: Get block hashes via RPC (minimal RPC usage)
         if not self.rpc_batch_call:
             raise ValueError("BLKFileReader requires rpc_batch_call for getting block hashes")
@@ -510,7 +514,7 @@ class BLKFileReader:
             target_hash = hash_results[height]
             
             # Find block in BLK files
-            blk_block = self._find_block_by_hash(target_hash)
+            blk_block = self._find_block_by_hash(target_hash, target_height=height)
             
             if blk_block:
                 # Convert BLK format to RPC format
@@ -519,5 +523,6 @@ class BLKFileReader:
                 result[height] = rpc_block
             else:
                 print(f"Warning: Block {height} (hash: {target_hash}) not found in BLK files")
-        
+
+        print(f"BLK: read {len(result)}/{len(heights)} blocks (heights {height_min}-{height_max})")
         return result

@@ -441,7 +441,7 @@ def find_bitcoin_folder() -> str:
     return os.path.expanduser("~/.bitcoin/blocks")
 
 
-def read_blk_file(blk_file_path: str, max_blocks: int = 1, xor_key: bytes = None, start_block_index: int = 0, shutdown_check: Optional[Callable[[], bool]] = None) -> Tuple[List[Dict[str, Any]], bytes]:
+def read_blk_file(blk_file_path: str, max_blocks: int = 1, xor_key: bytes = None, start_block_index: int = 0, shutdown_check: Optional[Callable[[], bool]] = None, target_height: Optional[int] = None) -> Tuple[List[Dict[str, Any]], bytes]:
     """
     Read blocks from a single blk*.dat file.
     
@@ -451,6 +451,7 @@ def read_blk_file(blk_file_path: str, max_blocks: int = 1, xor_key: bytes = None
         xor_key: Optional XOR key for deobfuscation (will be auto-detected if None)
         start_block_index: Block index to start reading from (default: 0)
         shutdown_check: Optional callable returning True if shutdown was requested (raises ShutdownRequested)
+        target_height: Optional block height we're searching for (for logging when used by indexer)
     
     Returns:
         Tuple of (list of block dictionaries, detected XOR key)
@@ -461,7 +462,8 @@ def read_blk_file(blk_file_path: str, max_blocks: int = 1, xor_key: bytes = None
         raise FileNotFoundError(f"Block file not found: {blk_file_path}")
     
     if start_block_index == 0:
-        print(f"Reading block file: {blk_file_path}")
+        height_msg = f" (height {target_height})" if target_height is not None else ""
+        print(f"Reading block file: {blk_file_path}{height_msg}")
         print(f"File size: {os.path.getsize(blk_file_path):,} bytes")
         print()
     
