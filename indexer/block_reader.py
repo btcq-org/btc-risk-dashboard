@@ -14,7 +14,7 @@ from io import BytesIO
 try:
     from .test_blk import (
         read_block, read_blk_file, read_xor_key_from_file, find_bitcoin_folder,
-        read_varint, apply_xor
+        read_varint, apply_xor, ShutdownRequested
     )
 except ImportError:
     # Fallback for direct execution
@@ -22,7 +22,7 @@ except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from indexer.test_blk import (
         read_block, read_blk_file, read_xor_key_from_file, find_bitcoin_folder,
-        read_varint, apply_xor
+        read_varint, apply_xor, ShutdownRequested
     )
 
 
@@ -377,7 +377,7 @@ class BLKFileReader:
     blocks in BLK files by matching block hash.
     """
     
-    def __init__(self, blocks_dir: Optional[str] = None, rpc_call=None, rpc_batch_call=None):
+    def __init__(self, blocks_dir: Optional[str] = None, rpc_call=None, rpc_batch_call=None, shutdown_check=None):
         """
         Initialize BLK file reader.
         
@@ -385,6 +385,7 @@ class BLKFileReader:
             blocks_dir: Path to Bitcoin blocks directory. If None, auto-detects.
             rpc_call: Optional RPC function for getting block hashes (minimal RPC usage)
             rpc_batch_call: Optional RPC batch function for getting multiple block hashes
+            shutdown_check: Optional callable returning True if shutdown requested (used while reading BLK files)
         """
         if blocks_dir:
             self.blocks_dir = blocks_dir
@@ -402,6 +403,7 @@ class BLKFileReader:
         # RPC functions for getting block hashes (minimal RPC usage)
         self.rpc_call = rpc_call
         self.rpc_batch_call = rpc_batch_call
+        self.shutdown_check = shutdown_check
         
         # Cache of blk files (will be populated on first use)
         self._blk_files = None
@@ -433,7 +435,8 @@ class BLKFileReader:
                     blk_file,
                     max_blocks=10000,  # Read in batches
                     xor_key=self.xor_key,
-                    start_block_index=0
+                    start_block_index=0,
+                    shutdown_check=self.shutdown_check
                 )
                 
                 for blk_block in blocks:

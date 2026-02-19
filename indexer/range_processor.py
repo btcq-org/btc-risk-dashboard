@@ -11,6 +11,7 @@ from . import db
 from .block_data import _extract_block_data
 from .utils import detect_script_type, address_from_vout
 from .block_reader import BlockReader
+from .test_blk import ShutdownRequested
 
 # Import database functions from main.py
 # These are standalone functions that don't create circular dependencies
@@ -101,6 +102,9 @@ def process_range(
         try:
             # Use block reader to fetch blocks
             block_results = block_reader.fetch_blocks(chunk_heights)
+        except ShutdownRequested:
+            print("Shutdown requested while reading BLK files")
+            break
         except Exception as e:
             print(f"Fatal error while fetching chunk {chunk_start}-{chunk_end}: {e}")
             raise

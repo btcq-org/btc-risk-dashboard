@@ -983,7 +983,8 @@ def main():
                 block_reader = BLKFileReader(
                     blocks_dir=blocks_dir,
                     rpc_call=rpc_call,
-                    rpc_batch_call=rpc_batch_call
+                    rpc_batch_call=rpc_batch_call,
+                    shutdown_check=lambda: shutdown_requested
                 )
                 print("Using BLK file reader for block fetching")
             else:

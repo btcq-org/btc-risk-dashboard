@@ -9,7 +9,11 @@ import struct
 import glob
 import argparse
 from io import BytesIO
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, Callable
+
+# Raised when shutdown is requested during BLK read (so callers can stop cleanly)
+class ShutdownRequested(Exception):
+    pass
 
 # Import script type detection utilities
 try:
@@ -211,8 +215,10 @@ def apply_xor(data: bytes, key: bytes, offset: int = 0) -> bytes:
     return bytes(data[i] ^ key[(offset + i) % len(key)] for i in range(len(data)))
 
 
-def read_block(f, xor_key: bytes = None) -> Dict[str, Any]:
+def read_block(f, xor_key: bytes = None, shutdown_check: Optional[Callable[[], bool]] = None) -> Dict[str, Any]:
     """Read a block from the block file."""
+    if shutdown_check is not None and shutdown_check():
+        raise ShutdownRequested()
     # Magic bytes (4 bytes, read as little-endian)
     magic_bytes_raw = f.read(4)
     if len(magic_bytes_raw) < 4:
@@ -437,7 +443,7 @@ def find_bitcoin_folder() -> str:
     return os.path.expanduser("~/.bitcoin/blocks")
 
 
-def read_blk_file(blk_file_path: str, max_blocks: int = 1, xor_key: bytes = None, start_block_index: int = 0) -> Tuple[List[Dict[str, Any]], bytes]:
+def read_blk_file(blk_file_path: str, max_blocks: int = 1, xor_key: bytes = None, start_block_index: int = 0, shutdown_check: Optional[Callable[[], bool]] = None) -> Tuple[List[Dict[str, Any]], bytes]:
     """
     Read blocks from a single blk*.dat file.
     
@@ -446,10 +452,13 @@ def read_blk_file(blk_file_path: str, max_blocks: int = 1, xor_key: bytes = None
         max_blocks: Maximum number of blocks to read (default: 1)
         xor_key: Optional XOR key for deobfuscation (will be auto-detected if None)
         start_block_index: Block index to start reading from (default: 0)
+        shutdown_check: Optional callable returning True if shutdown was requested (raises ShutdownRequested)
     
     Returns:
         Tuple of (list of block dictionaries, detected XOR key)
     """
+    if shutdown_check is not None and shutdown_check():
+        raise ShutdownRequested()
     if not os.path.isfile(blk_file_path):
         raise FileNotFoundError(f"Block file not found: {blk_file_path}")
     
@@ -464,6 +473,8 @@ def read_blk_file(blk_file_path: str, max_blocks: int = 1, xor_key: bytes = None
     
     with open(blk_file_path, 'rb') as f:
         while len(blocks) < max_blocks:
+            if shutdown_check is not None and shutdown_check():
+                raise ShutdownRequested()
             current_pos = f.tell()
             
             # Check if we're at the end of the file
@@ -471,7 +482,7 @@ def read_blk_file(blk_file_path: str, max_blocks: int = 1, xor_key: bytes = None
                 break
             
             try:
-                block = read_block(f, detected_xor_key)
+                block = read_block(f, detected_xor_key, shutdown_check)
                 if block is None:
                     # No more valid blocks
                     if current_pos == 0:
@@ -490,6 +501,8 @@ def read_blk_file(blk_file_path: str, max_blocks: int = 1, xor_key: bytes = None
                     blocks.append(block)
                 
                 block_count += 1
+            except ShutdownRequested:
+                raise
             except struct.error as e:
                 # End of file or invalid data
                 print(f"Struct error at position {current_pos}: {e}")
