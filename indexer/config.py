@@ -17,17 +17,17 @@ RPC_PORT = int(os.getenv("RPC_PORT", "18332"))
 RPC_URL = f"http://{RPC_HOST}:{RPC_PORT}/"
 
 # Block source: 'rpc' (Bitcoin Core RPC) or 'blk' (read from blk*.dat files)
-BLOCK_SOURCE = os.getenv("BLOCK_SOURCE", "rpc").lower()
+BLOCK_SOURCE = os.getenv("BLOCK_SOURCE", "blk").lower()
 # Path to blocks directory (only when BLOCK_SOURCE=blk). e.g. /path/to/data-bitcoin/blocks
-BLOCKS_DIR = os.getenv("BLOCKS_DIR", "~/data-bitcoin/blocks")
+BLOCKS_DIR = os.path.expanduser(os.getenv("BLOCKS_DIR", "~/data-bitcoin/blocks"))
 # Optional: Bitcoin data dir for auto-detecting blocks (e.g. ~/.bitcoin or /path/to/data-bitcoin)
-BITCOIN_DIR = os.getenv("BITCOIN_DIR", "~/data-bitcoin")
+BITCOIN_DIR = os.path.expanduser(os.getenv("BITCOIN_DIR", "~/data-bitcoin"))
 
 # ---------------------------------------------------------------------------
 # Database (PostgreSQL / TimescaleDB)
 # ---------------------------------------------------------------------------
 DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
-DB_PORT = int(os.getenv("DB_PORT", "7432"))
+DB_PORT = int(os.getenv("DB_PORT", "5432"))
 DB_NAME = os.getenv("DB_NAME", "postgres")
 DB_USER = os.getenv("DB_USER", "indexer")
 DB_PASS = os.getenv("DB_PASS", "password")
