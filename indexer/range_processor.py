@@ -173,6 +173,7 @@ def process_range(
                 deleted_balance_sat = 0
                 deleted_type_balances: Dict[str, int] = defaultdict(int)
                 deleted_type_counts: Dict[str, int] = defaultdict(int)
+                deleted_utxos = []
 
                 if out_lists['spend_rows']:
                     spend_start = time.time()

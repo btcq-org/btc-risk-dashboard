@@ -1,23 +1,5 @@
-CREATE TABLE IF NOT EXISTS address_status (
-    address TEXT NOT NULL,
-    script_pub_type TEXT NOT NULL,
-    reused BOOLEAN NOT NULL,
-    created_block BIGINT NOT NULL,
-    created_block_timestamp BIGINT NOT NULL,
-    balance_sat BIGINT NOT NULL DEFAULT 0,
-    PRIMARY KEY (address)
-);
-
--- Stats table for address status for latest block
--- TODO: This can be aggregated by timescaleDB for each block
-CREATE TABLE IF NOT EXISTS address_stats (
-    script_pub_type TEXT NOT NULL,
-    reused_sat BIGINT NOT NULL DEFAULT 0,
-    total_sat BIGINT NOT NULL DEFAULT 0,
-    reused_count BIGINT NOT NULL DEFAULT 0,
-    count BIGINT NOT NULL DEFAULT 0,
-    PRIMARY KEY (script_pub_type)
-);
+-- address_status and address_stats are created by schema.sql (main indexer).
+-- This file only defines tables used by the address module (address.py).
 
 CREATE TABLE IF NOT EXISTS address_global_stats (
     id INTEGER PRIMARY KEY DEFAULT 1,

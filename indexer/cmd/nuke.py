@@ -14,7 +14,7 @@ def nuke_schema():
         # Handle both regular VIEW and MATERIALIZED VIEW cases
         print("Dropping view/materialized view: address_status")
         try:
-            cur.execute("DROP MATERIALIZED VIEW IF EXISTS address_status CASCADE;")
+            cur.execute("DROP TABLE IF EXISTS address_status CASCADE;")
         except psycopg2.errors.WrongObjectType:
             # If it's a regular view (not a materialized view), drop it as a view
             cur.execute("DROP VIEW IF EXISTS address_status CASCADE;")
@@ -24,7 +24,7 @@ def nuke_schema():
         cur.execute("DROP MATERIALIZED VIEW IF EXISTS utxo_stats CASCADE;")
         
         print("Dropping materialized view: address_stats")
-        cur.execute("DROP MATERIALIZED VIEW IF EXISTS address_stats CASCADE;")
+        cur.execute("DROP TABLE IF EXISTS address_stats CASCADE;")
         
         print("Dropping materialized view: block_stats")
         cur.execute("DROP MATERIALIZED VIEW IF EXISTS block_stats CASCADE;")

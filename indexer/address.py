@@ -28,22 +28,18 @@ def schema_init():
     
     db.init_pool()
     with db.get_db_cursor() as cur:
-        # Check if address_status table exists (indicates schema is already initialized)
+        # Check if address-module tables exist (address_status is in schema.sql; we only create address_global_stats, p2pk_status here)
         cur.execute("""
             SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_schema = 'public' 
-                AND table_name = 'address_status'
+                SELECT FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = 'p2pk_status'
             )
         """)
-        table_exists = cur.fetchone()[0]
-        
-        if table_exists:
-            print("Address schema already initialized (address_status table exists), skipping initialization.")
+        if cur.fetchone()[0]:
+            print("Address schema already initialized (p2pk_status exists), skipping.")
             return
-        
-        # Schema not initialized, run the SQL
-        print("Initializing address database schema...")
+
+        print("Initializing address module tables (address_global_stats, p2pk_status)...")
         with open(schema_path, "r") as sf:
             schema_sql = sf.read()
         cur.execute(schema_sql)

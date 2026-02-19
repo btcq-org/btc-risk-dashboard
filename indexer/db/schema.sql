@@ -52,78 +52,33 @@ CREATE TABLE IF NOT EXISTS utxos (
 -- CREATE INDEX IF NOT EXISTS utxos_address_idx ON utxos (address);
 
 -- =======================
--- Address Status (computed from UTXOs)
+-- Address Status (table updated by indexer; has reused, created_block, etc.)
 -- =======================
 
--- Drop existing view if it exists (for migration)
+-- Drop materialized views if they exist (migration from MV to table)
+DROP MATERIALIZED VIEW IF EXISTS address_stats CASCADE;
+DROP MATERIALIZED VIEW IF EXISTS address_status CASCADE;
 DROP VIEW IF EXISTS address_status CASCADE;
 
--- Materialized view with latest status per address derived from utxos table
--- Pre-computes aggregations to avoid expensive subqueries on every query
--- Uses window functions to efficiently get latest script_pub_type without correlated subqueries
-CREATE MATERIALIZED VIEW address_status AS
-WITH script_type_ranked AS (
-    SELECT
-        address,
-        script_pub_type,
-        ROW_NUMBER() OVER (
-            PARTITION BY address 
-            ORDER BY 
-                CASE WHEN NOT spent THEN 0 ELSE 1 END,  -- Unspent first
-                created_block DESC, 
-                created_block_timestamp DESC
-        ) AS rn
-    FROM utxos
-    WHERE address IS NOT NULL AND address <> ''
-),
-latest_script_type AS (
-    SELECT address, script_pub_type
-    FROM script_type_ranked
-    WHERE rn = 1
-),
-per_addr AS (
-    SELECT
-        address,
-        MIN(created_block) AS first_seen_block,
-        MIN(created_block_timestamp) AS first_seen_block_timestamp,
-        GREATEST(
-            COALESCE(MAX(created_block), 0),
-            COALESCE(MAX(spent_block), 0)
-        ) AS last_seen_block,
-        GREATEST(
-            COALESCE(MAX(created_block_timestamp), 0),
-            COALESCE(MAX(spent_block_timestamp), 0)
-        ) AS last_seen_block_timestamp,
-        SUM(CASE WHEN NOT spent THEN value_sat ELSE 0 END) AS balance_sat,
-        COUNT(*) FILTER (WHERE NOT spent) AS utxo_count,
-        COUNT(*) AS appearances
-    FROM utxos
-    WHERE address IS NOT NULL AND address <> ''
-    GROUP BY address
-)
-SELECT
-    pa.address,
-    pa.first_seen_block,
-    pa.first_seen_block_timestamp,
-    pa.last_seen_block,
-    pa.last_seen_block_timestamp,
-    pa.balance_sat,
-    pa.utxo_count,
-    pa.appearances AS tx_count,
-    lst.script_pub_type
-FROM per_addr pa
-LEFT JOIN latest_script_type lst ON pa.address = lst.address;
+CREATE TABLE IF NOT EXISTS address_status (
+    address TEXT NOT NULL,
+    script_pub_type TEXT NOT NULL,
+    reused BOOLEAN NOT NULL,
+    created_block BIGINT NOT NULL,
+    created_block_timestamp BIGINT NOT NULL,
+    balance_sat BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (address)
+);
 
--- Indexes for fast lookups
 CREATE INDEX IF NOT EXISTS address_status_script_pub_type_idx ON address_status (script_pub_type);
 CREATE INDEX IF NOT EXISTS address_status_address_idx ON address_status (address);
 
--- Function to refresh the materialized view
+-- No-op: address_status is a table, not a materialized view
 CREATE OR REPLACE FUNCTION refresh_address_status() RETURNS void
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    REFRESH MATERIALIZED VIEW address_status;
+    NULL;
 END;
 $$;
 
@@ -156,27 +111,24 @@ END;
 $$;
 
 -- =======================
--- Address Stats Aggregation (computed from address_status)
+-- Address Stats (table updated by indexer from address_status)
 -- =======================
 
--- Drop existing view if it exists (for migration)
-DROP MATERIALIZED VIEW IF EXISTS address_stats CASCADE;
+CREATE TABLE IF NOT EXISTS address_stats (
+    script_pub_type TEXT NOT NULL,
+    reused_sat BIGINT NOT NULL DEFAULT 0,
+    total_sat BIGINT NOT NULL DEFAULT 0,
+    reused_count BIGINT NOT NULL DEFAULT 0,
+    count BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (script_pub_type)
+);
 
--- Materialized view with aggregated address statistics
--- Pre-computes address counts and risk classifications to avoid expensive queries on every API call
-CREATE MATERIALIZED VIEW address_stats AS
-SELECT
-    COUNT(*)::bigint AS address_count,
-    COUNT(*) FILTER (WHERE script_pub_type = ANY(ARRAY['P2PK', 'P2MS', 'P2PR']))::bigint AS high_risk_address_count,
-    COUNT(*) FILTER (WHERE script_pub_type = ANY(ARRAY['P2PKH', 'P2SH', 'P2WPKH', 'P2WSH']))::bigint AS medium_risk_address_count
-FROM address_status;
-
--- Function to refresh the address stats materialized view
+-- No-op: address_stats is a table, updated by indexer
 CREATE OR REPLACE FUNCTION refresh_address_stats() RETURNS void
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    REFRESH MATERIALIZED VIEW address_stats;
+    NULL;
 END;
 $$;
 
@@ -211,14 +163,12 @@ BEGIN
 END;
 $$;
 
--- Function to refresh all materialized views
+-- Function to refresh all materialized views (address_status/address_stats are tables, not MVs)
 CREATE OR REPLACE FUNCTION refresh_all_materialized_views() RETURNS void
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    REFRESH MATERIALIZED VIEW address_status;
     REFRESH MATERIALIZED VIEW utxo_stats;
-    REFRESH MATERIALIZED VIEW address_stats;
     REFRESH MATERIALIZED VIEW block_stats;
 END;
 $$;
