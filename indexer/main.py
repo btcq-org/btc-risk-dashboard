@@ -995,8 +995,9 @@ def main():
                 )
                 print("Using RPC reader for block fetching")
             
-            # Process range with selected block reader
-            process_range(start, tip, block_reader, chunk_size=CHUNK_SIZE, shutdown_check=lambda: shutdown_requested)
+            # Process range with selected block reader (BLK: 1000-block chunks, RPC: CHUNK_SIZE)
+            chunk_size = config.BLK_CHUNK_SIZE if BLOCK_SOURCE == 'blk' else CHUNK_SIZE
+            process_range(start, tip, block_reader, chunk_size=chunk_size, shutdown_check=lambda: shutdown_requested)
 
         if shutdown_requested:
             print("Shutdown requested during catch-up, exiting...")

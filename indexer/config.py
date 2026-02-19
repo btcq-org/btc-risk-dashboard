@@ -35,8 +35,10 @@ DB_PASS = os.getenv("DB_PASS", "password")
 # ---------------------------------------------------------------------------
 # Indexer tuning
 # ---------------------------------------------------------------------------
-# Blocks per catch-up chunk when using process_range
+# Blocks per catch-up chunk when using process_range (RPC mode)
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "10"))
+# Blocks per chunk when using BLK file reader (read N blocks from blk*.dat, then flush to DB)
+BLK_CHUNK_SIZE = int(os.getenv("BLK_CHUNK_SIZE", "1000"))
 # Max RPC retries for failed requests
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
 # Rows per DB insert page (execute_values / COPY)
