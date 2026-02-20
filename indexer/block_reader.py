@@ -16,6 +16,7 @@ try:
         read_block, read_blk_file, read_xor_key_from_file, find_bitcoin_folder,
         read_varint, apply_xor, ShutdownRequested
     )
+    from .core_block_index import get_block_location, blk_path_from_file_number
 except ImportError:
     # Fallback for direct execution
     import sys
@@ -24,6 +25,7 @@ except ImportError:
         read_block, read_blk_file, read_xor_key_from_file, find_bitcoin_folder,
         read_varint, apply_xor, ShutdownRequested
     )
+    from indexer.core_block_index import get_block_location, blk_path_from_file_number
 
 
 class BlockReader(Protocol):
@@ -409,6 +411,19 @@ class BLKFileReader:
         self._blk_files = None
         # Cache: block_hash -> (file_path, block_index_in_file)
         self._block_cache = {}
+        # Core block index (LevelDB) for direct seeks; fall back to file scan if unavailable
+        self._index_path = os.path.join(self.blocks_dir, "index")
+        if os.path.isdir(self._index_path):
+            print("BLK Reader: Core block index found (will use for direct seeks when available)")
+    
+    def _read_block_at_offset(self, file_path: str, offset: int) -> Optional[Dict[str, Any]]:
+        """Read a single block at the given file offset. Returns BLK-format block or None."""
+        try:
+            with open(file_path, 'rb') as f:
+                f.seek(offset)
+                return read_block(f, self.xor_key, self.shutdown_check)
+        except Exception:
+            return None
     
     def _get_blk_files(self) -> List[str]:
         """Get sorted list of blk*.dat files."""
@@ -419,6 +434,7 @@ class BLKFileReader:
     def _find_block_by_hash(self, target_hash: str, target_height: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """
         Find a block in BLK files by matching block hash.
+        Uses Core's block index (LevelDB) when available for direct seek; else scans files.
         
         Args:
             target_hash: Block hash to find (hex string, normal order)
@@ -427,6 +443,31 @@ class BLKFileReader:
         Returns:
             Block dict in BLK format, or None if not found
         """
+        # Try Core's block index first (direct file + offset)
+        loc = get_block_location(self._index_path, target_hash)
+        if loc is not None:
+            n_file, n_data_pos = loc
+            blk_path = blk_path_from_file_number(self.blocks_dir, n_file)
+            if os.path.isfile(blk_path):
+                blk_block = self._read_block_at_offset(blk_path, n_data_pos)
+                if blk_block is not None:
+                    # Verify hash matches
+                    header = blk_block.get('header', {})
+                    version = header.get('version', 0)
+                    prev_block_hash = bytes.fromhex(header.get('prev_block_hash', '0' * 64))[::-1]
+                    merkle_root = bytes.fromhex(header.get('merkle_root', '0' * 64))[::-1]
+                    header_bytes = (
+                        struct.pack('<I', version) +
+                        prev_block_hash +
+                        merkle_root +
+                        struct.pack('<I', header.get('timestamp', 0)) +
+                        struct.pack('<I', header.get('bits', 0)) +
+                        struct.pack('<I', header.get('nonce', 0))
+                    )
+                    if calculate_block_hash(header_bytes).lower() == target_hash.lower():
+                        return blk_block
+        
+        # Fall back to scanning blk files
         blk_files = self._get_blk_files()
         
         for blk_file in blk_files:
@@ -464,6 +505,10 @@ class BLKFileReader:
                     # Compare hashes (both should be in normal display order)
                     if block_hash.lower() == target_hash.lower():
                         return blk_block
+
+                # Block not in this file; try next (blocks are in arrival order, not height order)
+                if target_height is not None:
+                    print(f"BLK: height {target_height} not in {os.path.basename(blk_file)}, trying next file")
                         
             except ShutdownRequested:
                 raise
