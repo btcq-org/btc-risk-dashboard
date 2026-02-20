@@ -57,3 +57,17 @@ The RPC should now be available on port 30032 of your localhost.
 ```bash
 python ./indexer/quantum-at-risk.py
 ```
+
+### BLK direct seeks (optional, faster)
+
+To use Bitcoin Core’s block index and seek directly to blocks instead of scanning blk files, install `plyvel`. On systems that don’t allow global `pip install`:
+
+```bash
+sudo apt install python3.12-venv   # if needed
+cd /root/btcq-indexer
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python -m indexer.main
+```
+
+Run the indexer with `.venv/bin/python` so `plyvel` is used and you see direct seeks instead of “height N not in blk….dat, trying next file”.

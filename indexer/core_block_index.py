@@ -44,15 +44,37 @@ def get_block_location(index_path: str, block_hash_hex: str) -> Optional[Tuple[i
     Returns:
         (file_number, byte_offset) for blk*.dat, or None if not found / no index.
     """
+    loc = _get_block_index_record(index_path, block_hash_hex)
+    return (loc[0], loc[1]) if loc else None
+
+
+def get_block_height(index_path: str, block_hash_hex: str) -> Optional[int]:
+    """
+    Look up block height in Core's block index. Returns height or None.
+    
+    Args:
+        index_path: Path to blocks/index directory (LevelDB).
+        block_hash_hex: Block hash as hex string (RPC order, 64 chars).
+    
+    Returns:
+        Block height, or None if not found / no index.
+    """
+    loc = _get_block_index_record(index_path, block_hash_hex)
+    return loc[2] if loc else None
+
+
+def _get_block_index_record(index_path: str, block_hash_hex: str) -> Optional[Tuple[int, int, int]]:
+    """
+    Internal: look up block index record. Returns (n_file, n_data_pos, n_height) or None.
+    """
     try:
         import plyvel
     except ImportError:
         return None
-    
+
     if not os.path.isdir(index_path):
         return None
-    
-    # Key: 'b' + 32-byte hash in little-endian (reverse of RPC hex)
+
     try:
         hash_bytes = bytes.fromhex(block_hash_hex)
     except Exception:
@@ -60,40 +82,35 @@ def get_block_location(index_path: str, block_hash_hex: str) -> Optional[Tuple[i
     if len(hash_bytes) != 32:
         return None
     key = b'b' + hash_bytes[::-1]
-    
+
     try:
         db = plyvel.DB(index_path, create_if_missing=False)
     except Exception:
         return None
-    
+
     try:
         value = db.get(key)
     except Exception:
         value = None
     finally:
         db.close()
-    
+
     if not value or len(value) < 80:
         return None
-    
+
     offset = 0
-    # nVersion
     _, offset = _decode_varint(value, offset)
-    # nHeight
-    _, offset = _decode_varint(value, offset)
-    # nStatus
+    n_height, offset = _decode_varint(value, offset)
     n_status, offset = _decode_varint(value, offset)
-    # nTx
     _, offset = _decode_varint(value, offset)
-    
+
     if not (n_status & BLOCK_HAVE_DATA):
         return None
-    
-    # If status has bit 8 or 16, next varint is nFile
+
     n_file, offset = _decode_varint(value, offset)
     n_data_pos, offset = _decode_varint(value, offset)
-    
-    return (n_file, n_data_pos)
+
+    return (n_file, n_data_pos, n_height)
 
 
 def blk_path_from_file_number(blocks_dir: str, n_file: int) -> str:

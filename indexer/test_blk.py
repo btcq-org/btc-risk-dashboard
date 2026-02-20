@@ -314,13 +314,29 @@ def read_block(f, xor_key: bytes = None, shutdown_check: Optional[Callable[[], b
         block_size_raw = apply_xor(block_size_raw, xor_key, offset=size_pos)
     
     block_size = struct.unpack('<I', block_size_raw)[0]
-    
+    max_sane_size = 4 * 1024 * 1024  # 4 MB
+
     # Sanity check: Bitcoin blocks are capped by 4M weight (~1–2 MB serialized). Values
     # above a few MB usually mean obfuscated bytes (XOR not applied) or wrong file position.
-    if block_size == 0 or block_size > 4 * 1024 * 1024:  # 4 MB
-        print(f"[BLK] Warning: Invalid block size: {block_size} bytes (raw: {block_size_raw.hex()})")
-        print(f"[BLK] Likely obfuscation or wrong position; skipping rest of file.")
-        return None
+    if block_size == 0 or block_size > max_sane_size:
+        # Recovery: magic may have been a false positive, or xor_key (e.g. from xor.dat) may be wrong.
+        # Try detecting XOR key from magic and deobfuscating the size.
+        detected = detect_xor_key(magic_bytes_raw)
+        size_deob = apply_xor(block_size_raw, detected, offset=size_pos)
+        try_size = struct.unpack('<I', size_deob)[0]
+        if 0 < try_size <= max_sane_size:
+            xor_key = detected
+            block_size_raw = size_deob
+            block_size = try_size
+            # Deobfuscate magic for the result
+            magic_bytes_raw = apply_xor(magic_bytes_raw, xor_key, offset=magic_pos)
+            magic_bytes = struct.unpack('<I', magic_bytes_raw)[0]
+        else:
+            block_size = struct.unpack('<I', block_size_raw)[0]  # restore for error message
+        if block_size == 0 or block_size > max_sane_size:
+            print(f"[BLK] Warning: Invalid block size: {block_size} bytes (raw: {block_size_raw.hex()})")
+            print(f"[BLK] Likely obfuscation or wrong position; skipping rest of file.")
+            return None
     
     block_start = f.tell()
     

@@ -22,6 +22,10 @@ BLOCK_SOURCE = os.getenv("BLOCK_SOURCE", "blk").lower()
 BLOCKS_DIR = os.path.expanduser(os.getenv("BLOCKS_DIR", "~/data-bitcoin/blocks"))
 # Optional: Bitcoin data dir for auto-detecting blocks (e.g. ~/.bitcoin or /path/to/data-bitcoin)
 BITCOIN_DIR = os.path.expanduser(os.getenv("BITCOIN_DIR", "~/data-bitcoin"))
+# Optional: path to block index (LevelDB). Default: BLOCKS_DIR/index. If Bitcoin Core is running
+# it holds the lock; use a copy: stop Core, cp -r blocks/index /path/to/index-copy, start Core,
+# then set BLOCK_INDEX_DIR=/path/to/index-copy (or leave unset to scan blk files).
+BLOCK_INDEX_DIR = os.path.expanduser(os.getenv("BLOCK_INDEX_DIR", "./data/index").strip()) or None
 
 # ---------------------------------------------------------------------------
 # Database (PostgreSQL / TimescaleDB)
@@ -38,7 +42,7 @@ DB_PASS = os.getenv("DB_PASS", "password")
 # Blocks per catch-up chunk when using process_range (RPC mode)
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "10"))
 # Blocks per chunk when using BLK file reader (read N blocks from blk*.dat, then flush to DB)
-BLK_CHUNK_SIZE = int(os.getenv("BLK_CHUNK_SIZE", "1000"))
+BLK_CHUNK_SIZE = int(os.getenv("BLK_CHUNK_SIZE", "10"))
 # Max RPC retries for failed requests
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
 # Rows per DB insert page (execute_values / COPY)

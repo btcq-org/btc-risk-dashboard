@@ -27,3 +27,6 @@ build/
 
 # Data files
 data/
+
+.venv/
+.env.example

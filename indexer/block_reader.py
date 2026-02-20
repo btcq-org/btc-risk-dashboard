@@ -4,6 +4,7 @@ Block reader abstraction for fetching Bitcoin blocks from different sources.
 Supports both RPC and BLK file reading methods.
 """
 import os
+import sys
 import glob
 import hashlib
 import struct
@@ -379,12 +380,14 @@ class BLKFileReader:
     blocks in BLK files by matching block hash.
     """
     
-    def __init__(self, blocks_dir: Optional[str] = None, rpc_call=None, rpc_batch_call=None, shutdown_check=None):
+    def __init__(self, blocks_dir: Optional[str] = None, index_path: Optional[str] = None, rpc_call=None, rpc_batch_call=None, shutdown_check=None):
         """
         Initialize BLK file reader.
         
         Args:
             blocks_dir: Path to Bitcoin blocks directory. If None, auto-detects.
+            index_path: Optional path to block index (LevelDB). If None, uses blocks_dir/index.
+                       Use a copy of the index (e.g. BLOCK_INDEX_DIR) when Core is running.
             rpc_call: Optional RPC function for getting block hashes (minimal RPC usage)
             rpc_batch_call: Optional RPC batch function for getting multiple block hashes
             shutdown_check: Optional callable returning True if shutdown requested (used while reading BLK files)
@@ -412,10 +415,45 @@ class BLKFileReader:
         # Cache: block_hash -> (file_path, block_index_in_file)
         self._block_cache = {}
         # Core block index (LevelDB) for direct seeks; fall back to file scan if unavailable
-        self._index_path = os.path.join(self.blocks_dir, "index")
-        if os.path.isdir(self._index_path):
-            print("BLK Reader: Core block index found (will use for direct seeks when available)")
+        self._index_path = (index_path if index_path and os.path.isdir(index_path) else None) or os.path.join(self.blocks_dir, "index")
+        self._block_index_works = self._check_block_index_at_startup()
     
+    def _check_block_index_at_startup(self) -> bool:
+        """Try to use Core's block index; print reason if unavailable. Returns True if usable."""
+        # So user can confirm they're running with the venv that has plyvel
+        print("BLK Reader: Python", sys.executable)
+        try:
+            import plyvel
+            print("BLK Reader: plyvel OK")
+        except ImportError:
+            print("BLK Reader: plyvel not installed in this Python — will scan blk files. Run with same Python that has plyvel (e.g. .venv/bin/python -m indexer.main)")
+            return False
+        if not os.path.isdir(self._index_path):
+            print("BLK Reader: No block index at", self._index_path, "— will scan blk files")
+            return False
+        # Try open + one lookup (genesis hash)
+        genesis_hex = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+        try:
+            db = plyvel.DB(self._index_path, create_if_missing=False)
+            key = b'b' + bytes.fromhex(genesis_hex)[::-1]
+            value = db.get(key)
+            db.close()
+            if value and len(value) >= 80:
+                print("BLK Reader: Using Core block index for direct seeks")
+                return True
+            print("BLK Reader: block index open but genesis lookup failed — will scan blk files")
+            return False
+        except Exception as e:
+            err = str(e).strip()
+            if "LOCK" in err or "lock" in err.lower() or "Resource temporarily unavailable" in err:
+                print("BLK Reader: block index locked by Bitcoin Core — will scan blk files.")
+                print("  To use direct seeks while Core runs: stop Core, copy index, then set BLOCK_INDEX_DIR:")
+                print("    cp -r", self._index_path, "/path/to/index-copy   # while Core is stopped")
+                print("    export BLOCK_INDEX_DIR=/path/to/index-copy")
+            else:
+                print("BLK Reader: block index unavailable — will scan blk files:", e)
+            return False
+
     def _read_block_at_offset(self, file_path: str, offset: int) -> Optional[Dict[str, Any]]:
         """Read a single block at the given file offset. Returns BLK-format block or None."""
         try:
@@ -443,8 +481,8 @@ class BLKFileReader:
         Returns:
             Block dict in BLK format, or None if not found
         """
-        # Try Core's block index first (direct file + offset)
-        loc = get_block_location(self._index_path, target_hash)
+        # Try Core's block index first (direct file + offset) if startup check passed
+        loc = get_block_location(self._index_path, target_hash) if self._block_index_works else None
         if loc is not None:
             n_file, n_data_pos = loc
             blk_path = blk_path_from_file_number(self.blocks_dir, n_file)
