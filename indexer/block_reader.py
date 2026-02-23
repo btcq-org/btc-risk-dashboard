@@ -17,7 +17,7 @@ try:
         read_block, read_blk_file, read_xor_key_from_file, find_bitcoin_folder,
         read_varint, apply_xor, ShutdownRequested
     )
-    from .core_block_index import get_block_location, get_block_location_from_db, blk_path_from_file_number
+    from .core_block_index import get_block_location, get_block_location_from_db, blk_path_from_file_number, BLOCK_FILE_HEADER_SIZE
 except ImportError:
     # Fallback for direct execution
     import sys
@@ -26,7 +26,7 @@ except ImportError:
         read_block, read_blk_file, read_xor_key_from_file, find_bitcoin_folder,
         read_varint, apply_xor, ShutdownRequested
     )
-    from indexer.core_block_index import get_block_location, get_block_location_from_db, blk_path_from_file_number
+    from indexer.core_block_index import get_block_location, get_block_location_from_db, blk_path_from_file_number, BLOCK_FILE_HEADER_SIZE
 
 
 class BlockReader(Protocol):
@@ -459,11 +459,12 @@ class BLKFileReader:
                 print("BLK Reader: block index unavailable — will scan blk files:", e)
             return False
 
-    def _read_block_at_offset(self, file_path: str, offset: int) -> Optional[Dict[str, Any]]:
-        """Read a single block at the given file offset. Returns BLK-format block or None."""
+    def _read_block_at_offset(self, file_path: str, n_data_pos: int) -> Optional[Dict[str, Any]]:
+        """Read a single block. n_data_pos is the file offset of the block payload (Core index);
+        magic+size are 8 bytes before that."""
         try:
             with open(file_path, 'rb') as f:
-                f.seek(offset)
+                f.seek(n_data_pos - BLOCK_FILE_HEADER_SIZE)
                 return read_block(f, self.xor_key, self.shutdown_check)
         except Exception:
             return None

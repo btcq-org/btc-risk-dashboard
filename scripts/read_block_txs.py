@@ -104,11 +104,12 @@ def main():
         print("Error: blk file not found:", blk_path, file=sys.stderr)
         sys.exit(1)
 
-    # Read block
+    # Read block (n_data_pos is offset of payload; magic+size are 8 bytes before)
     from indexer.test_blk import read_block, read_xor_key_from_file
+    from indexer.core_block_index import BLOCK_FILE_HEADER_SIZE
     xor_key = read_xor_key_from_file(blocks_dir)
     with open(blk_path, "rb") as f:
-        f.seek(n_data_pos)
+        f.seek(n_data_pos - BLOCK_FILE_HEADER_SIZE)
         block = read_block(f, xor_key, None)
     if not block:
         print("Error: failed to read block at offset", n_data_pos, file=sys.stderr)

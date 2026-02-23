@@ -9,8 +9,15 @@ scanning blk*.dat files.
 
 Key: 'b' + 32-byte block hash (little-endian = RPC hash hex decoded then reversed).
 Value: CDiskBlockIndex serialization (varints + 80-byte header).
+
+n_data_pos in the index is the file offset of the block *payload* (first byte of the 80-byte
+header), not the magic. So the on-disk layout is: [magic 4][size 4][payload...]; magic starts
+at (n_data_pos - 8).
 """
 import os
+
+# Bytes before block payload in blk file: magic (4) + size (4). n_data_pos points at payload start.
+BLOCK_FILE_HEADER_SIZE = 8
 import struct
 from typing import Optional, Tuple
 

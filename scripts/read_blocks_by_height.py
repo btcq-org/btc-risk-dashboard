@@ -18,21 +18,22 @@ import argparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from indexer.test_blk import read_xor_key_from_file, apply_xor
-from indexer.core_block_index import iter_block_index_by_height, blk_path_from_file_number
+from indexer.core_block_index import iter_block_index_by_height, blk_path_from_file_number, BLOCK_FILE_HEADER_SIZE
 
 
 def read_block_size_at(blocks_dir: str, n_file: int, n_data_pos: int, xor_key: bytes) -> int:
-    """Read the 4-byte block size at n_data_pos+4 (after magic), deobfuscate if needed."""
+    """Read the 4-byte block size. n_data_pos is offset of block payload; size is at n_data_pos - 4."""
     path = blk_path_from_file_number(blocks_dir, n_file)
     if not os.path.isfile(path):
         return -1
+    size_offset = n_data_pos - 4  # 4 bytes before payload = size field
     with open(path, "rb") as f:
-        f.seek(n_data_pos + 4)
+        f.seek(size_offset)
         raw = f.read(4)
     if len(raw) < 4:
         return -1
     if xor_key:
-        raw = apply_xor(raw, xor_key, offset=n_data_pos + 4)
+        raw = apply_xor(raw, xor_key, offset=size_offset)
     return struct.unpack("<I", raw)[0]
 
 
