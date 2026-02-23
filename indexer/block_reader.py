@@ -17,7 +17,7 @@ try:
         read_block, read_blk_file, read_xor_key_from_file, find_bitcoin_folder,
         read_varint, apply_xor, ShutdownRequested
     )
-    from .core_block_index import get_block_location, blk_path_from_file_number
+    from .core_block_index import get_block_location, get_block_location_from_db, blk_path_from_file_number
 except ImportError:
     # Fallback for direct execution
     import sys
@@ -26,7 +26,7 @@ except ImportError:
         read_block, read_blk_file, read_xor_key_from_file, find_bitcoin_folder,
         read_varint, apply_xor, ShutdownRequested
     )
-    from indexer.core_block_index import get_block_location, blk_path_from_file_number
+    from indexer.core_block_index import get_block_location, get_block_location_from_db, blk_path_from_file_number
 
 
 class BlockReader(Protocol):
@@ -415,12 +415,17 @@ class BLKFileReader:
         # Cache: block_hash -> (file_path, block_index_in_file)
         self._block_cache = {}
         # Core block index (LevelDB) for direct seeks; fall back to file scan if unavailable
-        self._index_path = (index_path if index_path and os.path.isdir(index_path) else None) or os.path.join(self.blocks_dir, "index")
+        raw_index = (index_path if index_path and index_path.strip() else None) or None
+        if raw_index:
+            raw_index = os.path.expanduser(raw_index.strip())
+            if not os.path.isdir(raw_index):
+                raw_index = None
+        self._index_path = (os.path.abspath(raw_index) if raw_index else None) or os.path.join(self.blocks_dir, "index")
+        self._index_db = None  # keep open for lookups when index works
         self._block_index_works = self._check_block_index_at_startup()
     
     def _check_block_index_at_startup(self) -> bool:
-        """Try to use Core's block index; print reason if unavailable. Returns True if usable."""
-        # So user can confirm they're running with the venv that has plyvel
+        """Try to use Core's block index; keep DB open for lookups if available. Returns True if usable."""
         print("BLK Reader: Python", sys.executable)
         try:
             import plyvel
@@ -431,23 +436,23 @@ class BLKFileReader:
         if not os.path.isdir(self._index_path):
             print("BLK Reader: No block index at", self._index_path, "— will scan blk files")
             return False
-        # Try open + one lookup (genesis hash)
         genesis_hex = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
         try:
             db = plyvel.DB(self._index_path, create_if_missing=False)
             key = b'b' + bytes.fromhex(genesis_hex)[::-1]
             value = db.get(key)
-            db.close()
             if value and len(value) >= 80:
-                print("BLK Reader: Using Core block index for direct seeks")
+                self._index_db = db  # keep open for all lookups (avoids reopen/lock when Core runs)
+                print("BLK Reader: Using Core block index for direct seeks (index:", self._index_path + ")")
                 return True
+            db.close()
             print("BLK Reader: block index open but genesis lookup failed — will scan blk files")
             return False
         except Exception as e:
             err = str(e).strip()
             if "LOCK" in err or "lock" in err.lower() or "Resource temporarily unavailable" in err:
                 print("BLK Reader: block index locked by Bitcoin Core — will scan blk files.")
-                print("  To use direct seeks while Core runs: stop Core, copy index, then set BLOCK_INDEX_DIR:")
+                print("  To use direct seeks while Core runs: set BLOCK_INDEX_DIR to a copy of the index:")
                 print("    cp -r", self._index_path, "/path/to/index-copy   # while Core is stopped")
                 print("    export BLOCK_INDEX_DIR=/path/to/index-copy")
             else:
@@ -481,8 +486,13 @@ class BLKFileReader:
         Returns:
             Block dict in BLK format, or None if not found
         """
-        # Try Core's block index first (direct file + offset) if startup check passed
-        loc = get_block_location(self._index_path, target_hash) if self._block_index_works else None
+        # Try Core's block index first (direct file + offset); use open DB if we have it
+        if self._block_index_works and self._index_db is not None:
+            loc = get_block_location_from_db(self._index_db, target_hash)
+        elif self._block_index_works:
+            loc = get_block_location(self._index_path, target_hash)
+        else:
+            loc = None
         if loc is not None:
             n_file, n_data_pos = loc
             blk_path = blk_path_from_file_number(self.blocks_dir, n_file)

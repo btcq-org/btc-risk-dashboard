@@ -25,7 +25,7 @@ BITCOIN_DIR = os.path.expanduser(os.getenv("BITCOIN_DIR", "~/data-bitcoin"))
 # Optional: path to block index (LevelDB). Default: BLOCKS_DIR/index. If Bitcoin Core is running
 # it holds the lock; use a copy: stop Core, cp -r blocks/index /path/to/index-copy, start Core,
 # then set BLOCK_INDEX_DIR=/path/to/index-copy (or leave unset to scan blk files).
-BLOCK_INDEX_DIR = os.path.expanduser(os.getenv("BLOCK_INDEX_DIR", "./data/index").strip()) or None
+BLOCK_INDEX_DIR = os.path.expanduser(os.getenv("BLOCK_INDEX_DIR", "").strip()) or None
 
 # ---------------------------------------------------------------------------
 # Database (PostgreSQL / TimescaleDB)
