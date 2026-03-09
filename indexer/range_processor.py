@@ -222,8 +222,9 @@ def process_range(
                 stats_batch = prepare_stats_batch(net_total_utxo, net_type_counts, net_total_balance_sat, net_type_balances)
                 upsert_stats(cur, stats_batch)
 
-                # Update address_stats table for affected script types
-                update_address_stats_incremental(cur, out_lists['vout_rows'], deleted_utxos)
+                # Skip address_stats refresh during catch-up to avoid rescanning
+                # large portions of address_status on every chunk. Live sync still
+                # updates address_stats in process_single_block().
 
             db_time = time.time() - db_start
             print(f"[Chunk {chunk_start}-{chunk_end}] Database write completed in {db_time:.3f}s")
