@@ -42,6 +42,7 @@ MAX_RETRIES = config.MAX_RETRIES
 DB_PAGE_ROWS = config.DB_PAGE_ROWS
 IS_UTXO = config.IS_UTXO
 IS_RECALC = config.IS_RECALC
+STOP_AT_HEIGHT = config.STOP_AT_HEIGHT
 
 # ========================
 # RPC UTILS
@@ -970,8 +971,13 @@ def main():
             return
 
         epsilon = 100
-        if start + epsilon <= tip:
-            print(f"Catching up: processing blocks {start} → {tip}")
+        end = min(tip, STOP_AT_HEIGHT) if STOP_AT_HEIGHT is not None else tip
+        # Run chunked catch-up when 100+ blocks to process, or when STOP_AT_HEIGHT is set (process up to end)
+        if start <= end and (start + epsilon <= end or STOP_AT_HEIGHT is not None):
+            if STOP_AT_HEIGHT is not None and end < tip:
+                print(f"Catching up: processing blocks {start} → {end} (STOP_AT_HEIGHT={STOP_AT_HEIGHT}, chain tip {tip})")
+            else:
+                print(f"Catching up: processing blocks {start} → {tip}")
             
             # Choose block reader based on configuration
             from .block_reader import RPCBlockReader, BLKFileReader
@@ -980,6 +986,7 @@ def main():
             BLOCK_SOURCE = config.BLOCK_SOURCE
             if BLOCK_SOURCE == 'blk':
                 blocks_dir = config.BLOCKS_DIR
+                # BLOCK_INDEX_DIR: use a copy of blocks/index when Core is running (it holds the lock)
                 block_reader = BLKFileReader(
                     blocks_dir=blocks_dir,
                     index_path=config.BLOCK_INDEX_DIR,
@@ -998,10 +1005,20 @@ def main():
             
             # Process range with selected block reader (BLK: 1000-block chunks, RPC: CHUNK_SIZE)
             chunk_size = config.BLK_CHUNK_SIZE if BLOCK_SOURCE == 'blk' else CHUNK_SIZE
-            process_range(start, tip, block_reader, chunk_size=chunk_size, shutdown_check=lambda: shutdown_requested)
+            process_range(start, end, block_reader, chunk_size=chunk_size, shutdown_check=lambda: shutdown_requested)
+
+            if not shutdown_requested:
+                from .address import calculate_address_stats
+                print("Refreshing address_stats after catch-up...")
+                calculate_address_stats()
 
         if shutdown_requested:
             print("Shutdown requested during catch-up, exiting...")
+            db.shutdown_pool()
+            sys.exit(0)
+
+        if STOP_AT_HEIGHT is not None:
+            print(f"Catch-up complete (stopped at height {STOP_AT_HEIGHT}). Exiting.")
             db.shutdown_pool()
             sys.exit(0)
 

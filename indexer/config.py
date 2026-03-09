@@ -59,3 +59,6 @@ RECONNECT_DELAY = float(os.getenv("RECONNECT_DELAY", "5.0"))
 IS_UTXO = bool(int(os.getenv("IS_UTXO", "0")))
 # Recalculate stats from DB and exit (no block processing)
 IS_RECALC = bool(int(os.getenv("IS_RECALC", "0")))
+# Stop at this block height (inclusive); no continuous sync after. Unset = no limit.
+_stop = os.getenv("STOP_AT_HEIGHT", "").strip()
+STOP_AT_HEIGHT = int(_stop) if _stop.isdigit() else None
