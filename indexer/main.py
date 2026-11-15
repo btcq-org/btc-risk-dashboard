@@ -628,6 +628,136 @@ def get_last_processed_height():
         print(f"Error getting last processed height: {e}")
         return 0
 
+# ========================
+# Reorg handling
+# ========================
+MAX_REORG_DEPTH = int(os.getenv('MAX_REORG_DEPTH', '100'))
+UTXO_SNAPSHOT_HEIGHT = 923867  # rows from the CSV import with no address were skipped
+
+
+def get_stored_block_hash(cur, height):
+    cur.execute("SELECT block_hash FROM block_log WHERE block_height = %s ORDER BY scanned_at DESC LIMIT 1", (height,))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def _apply_address_deltas(cur, deltas, height, block_ts):
+    """deltas: {address: (balance_delta, script_type)}. Creates missing addresses."""
+    rows = [(a, st, False, height, block_ts, d) for a, (d, st) in deltas.items() if a]
+    if rows:
+        execute_values(cur, """
+            INSERT INTO address_status (address, script_pub_type, reused, created_block, created_block_timestamp, balance_sat)
+            VALUES %s
+            ON CONFLICT (address) DO UPDATE SET balance_sat = address_status.balance_sat + EXCLUDED.balance_sat
+        """, rows)
+
+
+def rollback_block(cur, height, stale_hash):
+    """
+    Undo a block that is no longer on the main chain, inside the caller's transaction.
+    Uses the stale block's data from bitcoind (verbosity 3 includes the spent prevouts).
+    """
+    block = rpc_call("getblock", [stale_hash, 3])
+    block_ts = int(block.get('time', 0) * 1_000_000_000)
+    block_txids = {tx["txid"] for tx in block["tx"]}
+
+    # 1. Remove the outputs this block created.
+    created = [(tx["txid"], i) for tx in block["tx"] for i in range(len(tx.get("vout", [])))]
+    removed = []
+    for i in range(0, len(created), DB_PAGE_ROWS):
+        page = created[i:i + DB_PAGE_ROWS]
+        ph = ','.join(['(%s, %s)'] * len(page))
+        cur.execute(f"""
+            DELETE FROM utxos WHERE (txid, vout) IN (VALUES {ph}) AND created_block = %s
+            RETURNING address, value_sat, script_pub_type
+        """, [x for p in page for x in p] + [height])
+        removed.extend(cur.fetchall())
+
+    # 2. Put back the coins this block spent (except ones created inside this same block).
+    restore = []
+    prev_heights = set()
+    for tx in block["tx"]:
+        for vin in tx.get("vin", []):
+            if "coinbase" in vin or vin.get("txid") in block_txids:
+                continue
+            p = vin.get("prevout")
+            if p is None:
+                raise RuntimeError(f"Block {stale_hash} has no prevout data; cannot roll back")
+            spk = p.get("scriptPubKey", {})
+            address = address_from_vout({"scriptPubKey": spk})
+            if address is None and p["height"] <= UTXO_SNAPSHOT_HEIGHT:
+                continue  # never stored: the snapshot import skipped addressless outputs
+            restore.append([vin["txid"], vin["vout"], address, int(round(float(p["value"]) * 100_000_000)),
+                            spk.get("hex", ""), detect_script_type(spk), p["height"], 0])
+            prev_heights.add(p["height"])
+    if restore:
+        cur.execute("SELECT block_height, block_timestamp FROM block_log WHERE block_height = ANY(%s)",
+                    (list(prev_heights),))
+        ts_by_height = dict(cur.fetchall())
+        for r in restore:
+            r[7] = ts_by_height.get(r[6], 0)
+    restored = execute_values(cur, """
+        INSERT INTO utxos (txid, vout, address, value_sat, script_pub_key_hex, script_pub_type,
+                           created_block, created_block_timestamp)
+        VALUES %s ON CONFLICT (txid, vout) DO NOTHING
+        RETURNING address, value_sat, script_pub_type
+    """, [tuple(r) for r in restore], page_size=DB_PAGE_ROWS, fetch=True) if restore else []
+
+    # 3. Address balances and stats.
+    deltas = {}
+    type_counts, type_bal = defaultdict(int), defaultdict(int)
+    for rows, sign in ((removed, -1), (restored, 1)):
+        for address, value, st in rows:
+            if address:
+                d, _ = deltas.get(address, (0, st))
+                deltas[address] = (d + sign * value, st)
+            type_counts[st] += sign
+            type_bal[st] += sign * value
+    _apply_address_deltas(cur, deltas, height, block_ts)
+    # Addresses first seen in the stale block that now hold nothing.
+    cur.execute("DELETE FROM address_status WHERE created_block = %s AND balance_sat = 0", (height,))
+    upsert_stats(cur, prepare_stats_batch(
+        sum(type_counts.values()),
+        {k: v for k, v in type_counts.items() if v},
+        sum(type_bal.values()),
+        {k: v for k, v in type_bal.items() if v},
+    ))
+    if removed or restored:
+        update_address_stats_incremental(cur, [], removed + restored)
+
+    # 4. Forget the block.
+    cur.execute("DELETE FROM block_log WHERE block_height = %s AND block_hash = %s", (height, stale_hash))
+    print(f"[Reorg] Rolled back block {height} ({stale_hash[:16]}...): "
+          f"removed {len(removed)} outputs, restored {len(restored)} spent coins, "
+          f"net {sum(type_bal.values()) / 1e8:+,.8f} BTC")
+
+
+def handle_reorgs(dry_run=False):
+    """
+    Roll back stored blocks that are no longer on bitcoind's main chain.
+    Returns the number of blocks rolled back. Stops with an error past MAX_REORG_DEPTH.
+    """
+    with db.get_db_cursor() as cur:
+        height = get_last_processed_height()
+        rolled = 0
+        while height > 0:
+            stored = get_stored_block_hash(cur, height)
+            if stored is None or stored == "0" * 64:
+                break  # gap or the snapshot marker row: nothing to compare
+            if stored == rpc_call("getblockhash", [height]):
+                break
+            if rolled >= MAX_REORG_DEPTH:
+                raise RuntimeError(f"Reorg deeper than {MAX_REORG_DEPTH} blocks at height {height}; stopping")
+            print(f"[Reorg] Block {height} {stored[:16]}... is no longer on the main chain")
+            rollback_block(cur, height, stored)
+            rolled += 1
+            height -= 1
+        if dry_run:
+            cur.connection.rollback()
+            print(f"[Reorg] Dry run: {rolled} block(s) would be rolled back; nothing written.")
+    return rolled
+
+
 def process_single_block(height):
     """Process a single block and extract VOUTs (UTXOs) to database."""
     if shutdown_requested:
@@ -643,6 +773,13 @@ def process_single_block(height):
             print(f"Block {height} not yet available (bitcoind may still be syncing)")
             return False
         print(f"Error reading block {height}: {e}")
+        return False
+
+    # The block must build on the block we stored at height-1, or a reorg happened.
+    with db.get_db_cursor() as cur:
+        prev_stored = get_stored_block_hash(cur, height - 1)
+    if prev_stored and prev_stored != "0" * 64 and block.get("previousblockhash") != prev_stored:
+        print(f"[Block {height}] Parent doesn't match stored block {height - 1}; reorg will be handled on next poll")
         return False
 
     block_data = _extract_block_data(block, height, blockhash)
@@ -891,7 +1028,9 @@ def process_range(start_height, end_height, chunk_size=CHUNK_SIZE):
             db_time = time.time() - db_start
             print(f"[Chunk {chunk_start}-{chunk_end}] Database write completed in {db_time:.3f}s")
         except Exception as e:
+            # Stop instead of moving on: later chunks would leave a permanent gap in block_log.
             print(f"Error writing chunk {chunk_start}-{chunk_end} to PostgreSQL: {e}")
+            raise
         print(f"Saved and flushed chunk {chunk_start}–{chunk_end}")
 
 def read_utxo(height: int = 840_000, batch_size: int = 1_000_000):
@@ -1027,6 +1166,9 @@ def main():
         sys.exit(1)
 
     try:
+        if not IS_UTXO and not IS_RECALC:
+            if handle_reorgs():
+                last = get_last_processed_height()
         tip = rpc_call("getblockcount")
         start = max(0, last + 1)
 
@@ -1080,6 +1222,7 @@ def main():
 
         while not shutdown_requested:
             try:
+                handle_reorgs()
                 current_tip = rpc_call("getblockcount")
                 last_processed = get_last_processed_height()
 
@@ -1090,6 +1233,7 @@ def main():
                             break
                         # Retry logic for individual blocks
                         retries = 0
+                        success = False
                         while retries < MAX_RETRIES:
                             success = process_single_block(height)
                             if success:
@@ -1100,6 +1244,11 @@ def main():
                                 time.sleep(1)
                             else:
                                 print(f"Failed to process block {height} after {MAX_RETRIES} retries")
+                        if not success:
+                            # Never skip a block: later blocks would raise MAX(block_height)
+                            # past it and it would never be indexed. Retry it on the next poll.
+                            time.sleep(RECONNECT_DELAY)
+                            break
 
                 # Wait before next poll
                 time.sleep(POLL_INTERVAL)
