@@ -39,12 +39,22 @@ def address_from_vout(v: Dict[str, Any]) -> Optional[str]:
     if address:
         return address
 
-    script_hex = v.get("scriptPubKey", {}).get("hex")
+    # OP_RETURN outputs have no address. pycoin would return "(nulldata <hex>)",
+    # which can exceed Postgres' btree index row limit and fail the whole block.
+    if spk.get("type") == "nulldata":
+        return None
+
+    # Fallback mainly for P2PK, which Core RPC doesn't give an address for.
+    script_hex = spk.get("hex")
     if script_hex:
         script_bytes = bytes.fromhex(script_hex)
         address = network.address.for_script(script_bytes)
         if address:
-            return str(address)
+            address = str(address)
+            # pycoin returns placeholders like "???" or "(...)" for unknown scripts.
+            if address.startswith("(") or "?" in address or len(address) > 100:
+                return None
+            return address
 
     return None
 
