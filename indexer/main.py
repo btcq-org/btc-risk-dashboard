@@ -551,6 +551,27 @@ def get_last_processed_height():
         print(f"Error getting last processed height: {e}")
         return 0
 
+def check_block_log_contiguous():
+    """
+    Raise if block_log has missing heights between its lowest and highest entry.
+
+    The indexer resumes from MAX(block_height), so a gap would never be filled in.
+    It can't be back-filled safely either: later blocks have already been applied
+    without the gap's outputs and spends, so the UTXO set is wrong and needs a re-sync.
+    """
+    with db.get_db_cursor() as cur:
+        cur.execute("SELECT MIN(block_height), MAX(block_height), COUNT(*) FROM block_log")
+        row = cur.fetchone()
+    if not row or row[0] is None:
+        return
+    lo, hi, count = row
+    expected = hi - lo + 1
+    if count != expected:
+        raise RuntimeError(
+            f"block_log has {expected - count} missing height(s) between {lo} and {hi}. "
+            f"The UTXO set is incomplete; re-sync the database from scratch."
+        )
+
 def process_single_block(height):
     """Process a single block and extract VOUTs (UTXOs) to database."""
     if shutdown_requested:
@@ -936,6 +957,12 @@ def main():
     db.init_pool()
 
     schema_init()
+    try:
+        check_block_log_contiguous()
+    except RuntimeError as e:
+        print(f"Fatal: {e}")
+        db.shutdown_pool()
+        sys.exit(1)
     last = get_last_processed_height()
 
     # Initial catch-up: process from last_processed to current tip
@@ -1055,6 +1082,7 @@ def main():
                             break
                         # Retry logic for individual blocks
                         retries = 0
+                        success = False
                         while retries < MAX_RETRIES:
                             success = process_single_block(height)
                             if success:
@@ -1065,6 +1093,11 @@ def main():
                                 time.sleep(1)
                             else:
                                 print(f"Failed to process block {height} after {MAX_RETRIES} retries")
+                        if not success:
+                            # Never skip a block: later blocks would raise MAX(block_height)
+                            # past it and it would never be indexed. Retry it on the next poll.
+                            time.sleep(RECONNECT_DELAY)
+                            break
 
                 # Wait before next poll
                 time.sleep(POLL_INTERVAL)

@@ -117,8 +117,9 @@ def process_range(
             block = block_results.get(height)
 
             if block is None:
-                print(f"Warning: Block {height} not found by block reader")
-                continue
+                # Never skip a block: later chunks would raise MAX(block_height)
+                # past it and it would never be indexed.
+                raise RuntimeError(f"Block {height} not found by block reader; stopping")
 
             # Get block hash from block (RPC format has 'hash' field, or '_blockhash' from RPC reader)
             blockhash = block.get('hash') or block.get('_blockhash', '')
@@ -229,5 +230,7 @@ def process_range(
             db_time = time.time() - db_start
             print(f"[Chunk {chunk_start}-{chunk_end}] Database write completed in {db_time:.3f}s")
         except Exception as e:
+            # The chunk was rolled back as a whole; continuing would leave a permanent gap.
             print(f"Error writing chunk {chunk_start}-{chunk_end} to PostgreSQL: {e}")
+            raise
         print(f"Saved and flushed chunk {chunk_start}–{chunk_end}")
