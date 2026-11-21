@@ -13,17 +13,25 @@ services:
       - 18333:18333
 
   pg:
-    image: timescale/timescaledb:2.13.0-pg15
+    image: timescale/timescaledb:2.28.3-pg15
     shm_size: 512m
     command: postgres -c plan_cache_mode=force_custom_plan
+    # Passwords come from .env (see .env.example); compose refuses to start without them.
+    # POSTGRES_USER is the superuser and is for administration only. The indexer and
+    # API use the non-superuser roles that db-init/01-roles.sh creates.
     environment:
       - POSTGRES_DB=postgres
-      - POSTGRES_USER=indexer
-      - POSTGRES_PASSWORD=password
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      - INDEXER_DB_PASSWORD=${DB_PASS:?set DB_PASS in .env}
+      - API_DB_PASSWORD=${API_DB_PASS:?set API_DB_PASS in .env}
+    # Bound to localhost only, for the indexer and API running on the host.
+    # Never publish this port on 0.0.0.0.
     ports:
-      - 5432:5432
+      - 127.0.0.1:5432:5432
     volumes:
       - pg:/var/lib/postgresql/data
+      - ./db-init:/docker-entrypoint-initdb.d:ro
   
   # indexer:
   #   build:

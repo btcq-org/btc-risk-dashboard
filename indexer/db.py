@@ -10,24 +10,42 @@ from . import config
 DB_HOST = config.DB_HOST
 DB_PORT = config.DB_PORT
 DB_NAME = config.DB_NAME
-DB_USER = config.DB_USER
-DB_PASS = config.DB_PASS
+
+# Credentials used when the pool is created. The indexer uses DB_USER/DB_PASS;
+# the API switches to the read-only role with use_credentials() before connecting.
+_user = config.DB_USER
+_password = config.DB_PASS
+_password_env = "DB_PASS"  # named in the error when the password is missing
 
 # Connection pool (min=1, max=20 connections)
 _pool = None
+
+def use_credentials(user, password, password_env="DB_PASS"):
+    """Select the role the pool connects as. Must be called before the pool is created."""
+    global _user, _password, _password_env
+    if _pool is not None:
+        raise RuntimeError("use_credentials() must be called before the connection pool is created")
+    if not password:
+        raise RuntimeError(f"{password_env} is not set. Set it in the environment or .env (there is no default password).")
+    _user, _password, _password_env = user, password, password_env
 
 def init_pool():
     """Initialize the connection pool. Call this once at startup."""
     global _pool
     if _pool is None:
+        if not _password:
+            raise RuntimeError(
+                f"{_password_env} is not set. Set it in the environment or .env "
+                f"(there is no default password)."
+            )
         _pool = ThreadedConnectionPool(
             minconn=1,
             maxconn=20,
             host=DB_HOST,
             port=DB_PORT,
             dbname=DB_NAME,
-            user=DB_USER,
-            password=DB_PASS
+            user=_user,
+            password=_password
         )
 
 def shutdown_pool():
@@ -59,5 +77,5 @@ def get_db_cursor(cursor_factory=None):
         if conn is not None:
             _pool.putconn(conn)
 
-# Initialize pool on module import
-init_pool()
+# The pool is created on first use (get_db_cursor) or by an explicit init_pool(), not at
+# import, so the API can pick its read-only role with use_credentials() first.
