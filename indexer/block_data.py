@@ -7,6 +7,16 @@ from typing import Dict, Callable, Optional
 
 from .utils import detect_script_type, address_from_vout
 
+# BIP30: the only two coinbase transactions that reuse the txid of an earlier,
+# still-unspent coinbase (mainnet). Bitcoin Core lets the second copy overwrite
+# the first, so the UTXO set holds a single output for each txid. Indexing the
+# second copy would violate utxos_pkey and double-count the supply, so its
+# outputs are skipped. Keyed by (height, txid) so no other block can match.
+BIP30_DUPLICATE_COINBASES = {
+    (91842, "d5d27987d2a3dfc724e359870c6644b40e497bdc0589a033220fe15429d88599"),  # dup of 91812
+    (91880, "e3bf3d07d4b0375638d5f1db5255fe07ba2c4cb067cd81b84ee974b6585fb468"),  # dup of 91722
+}
+
 
 def _extract_block_data(block, height, blockhash, shutdown_check: Optional[Callable[[], bool]] = None):
     """
@@ -30,6 +40,10 @@ def _extract_block_data(block, height, blockhash, shutdown_check: Optional[Calla
         txid = tx.get("txid", "")
         if shutdown_check and shutdown_check():
             return None
+
+        if (height, txid) in BIP30_DUPLICATE_COINBASES:
+            print(f"Block {height}: skipping outputs of BIP30 duplicate coinbase {txid}")
+            continue
 
         for vin_idx, vin in enumerate(tx.get("vin", [])):
             if "coinbase" in vin:
