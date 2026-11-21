@@ -33,8 +33,13 @@ BLOCK_INDEX_DIR = os.path.expanduser(os.getenv("BLOCK_INDEX_DIR", "").strip()) o
 DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
 DB_PORT = int(os.getenv("DB_PORT", "5432"))
 DB_NAME = os.getenv("DB_NAME", "postgres")
+# Indexer role: owns the schema and writes blocks/UTXOs/stats. Not a superuser.
 DB_USER = os.getenv("DB_USER", "indexer")
-DB_PASS = os.getenv("DB_PASS", "password")
+# No default: the indexer refuses to connect until a password is set explicitly.
+DB_PASS = os.getenv("DB_PASS") or None
+# API role: SELECT-only (see db-init/01-roles.sh). Used by indexer/api.py.
+API_DB_USER = os.getenv("API_DB_USER", "api_ro")
+API_DB_PASS = os.getenv("API_DB_PASS") or None
 
 # ---------------------------------------------------------------------------
 # Indexer tuning

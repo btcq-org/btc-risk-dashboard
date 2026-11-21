@@ -1,8 +1,11 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from . import db
+from . import config, db
 from psycopg2.extras import RealDictCursor
 from typing import Optional
+
+# The API only reads, so it connects as the SELECT-only role, never as the indexer role.
+db.use_credentials(config.API_DB_USER, config.API_DB_PASS, password_env="API_DB_PASS")
 
 app = FastAPI()
 
