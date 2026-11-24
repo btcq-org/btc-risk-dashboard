@@ -22,13 +22,15 @@ from collections import defaultdict
 from bitcoin import SelectParams
 from pycoin.symbols.btc import network
 
-SelectParams('mainnet')
+SelectParams("mainnet")
+
 
 def _read_exact(f, n: int) -> bytes:
     data = f.read(n)
     if len(data) != n:
         raise ValueError("Unexpected EOF while reading")
     return data
+
 
 def read_compactsize(f) -> int:
     """
@@ -38,13 +40,14 @@ def read_compactsize(f) -> int:
     if first < 253:
         return first
     if first == 253:
-        return struct.unpack('<H', _read_exact(f, 2))[0]
+        return struct.unpack("<H", _read_exact(f, 2))[0]
     if first == 254:
-        return struct.unpack('<I', _read_exact(f, 4))[0]
+        return struct.unpack("<I", _read_exact(f, 4))[0]
     if first == 255:
-        return struct.unpack('<Q', _read_exact(f, 8))[0]
-    
+        return struct.unpack("<Q", _read_exact(f, 8))[0]
+
     return 0
+
 
 def read_varint(f) -> int:
     """
@@ -54,12 +57,13 @@ def read_varint(f) -> int:
     for _ in range(9):
         next_byte = _read_exact(f, 1)[0]
         result <<= 7
-        result += (next_byte & 0x7F)
+        result += next_byte & 0x7F
         if next_byte & 0x80:
             result += 1
         else:
             return result
     raise ValueError("Too big read_varint")
+
 
 def decompress_amount(x) -> int:
     if x == 0:
@@ -75,11 +79,11 @@ def decompress_amount(x) -> int:
         n = x * 10 + d
     else:
         n = x + 1
-    
+
     while e > 0:
         n *= 10
         e -= 1
-    
+
     return n
 
 
@@ -89,46 +93,62 @@ def classify_script(script: bytes) -> str:
     Returns a string like 'P2PKH', 'P2SH', 'P2WPKH', 'P2PK', 'P2WSH', 'nonstandard'.
     """
     if not script:
-        return 'null'
+        return "null"
 
     # P2WPKH: OP_0 PUSH 20-byte key hash (0x0014 + 20 bytes)
     if len(script) == 22 and script[0] == 0x00 and script[1] == 0x14:
-        return 'P2WPKH'
+        return "P2WPKH"
 
     # P2WSH: OP_0 PUSH 32-byte script hash (0x0020 + 32 bytes)
     if len(script) == 34 and script[0] == 0x00 and script[1] == 0x20:
-        return 'P2WSH'
+        return "P2WSH"
 
     # P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG (76a914<20>88ac)
-    if len(script) == 25 and script[0] == 0x76 and script[1] == 0xa9 and script[23] == 0x88 and script[24] == 0xac:
-        return 'P2PKH'
+    if (
+        len(script) == 25
+        and script[0] == 0x76
+        and script[1] == 0xA9
+        and script[23] == 0x88
+        and script[24] == 0xAC
+    ):
+        return "P2PKH"
 
     # P2SH: OP_HASH160 <20> OP_EQUAL (a914<20>87)
-    if len(script) == 23 and script[0] == 0xa9 and script[1] == 0x14 and script[22] == 0x87:
-        return 'P2SH'
+    if (
+        len(script) == 23
+        and script[0] == 0xA9
+        and script[1] == 0x14
+        and script[22] == 0x87
+    ):
+        return "P2SH"
 
     # P2PK: PUSH <pubkey> OP_CHECKSIG (e.g., 41<65 bytes>ac for uncompressed)
-    if len(script) > 2 and script[-1] == 0xac and script[0] in (0x21, 0x41):  # Push 33/65 bytes
+    if (
+        len(script) > 2 and script[-1] == 0xAC and script[0] in (0x21, 0x41)
+    ):  # Push 33/65 bytes
         pubkey_len = script[0]
         if len(script) == pubkey_len + 2:
-            return 'P2PK'
+            return "P2PK"
 
-    return 'nonstandard'
+    return "nonstandard"
+
 
 def read_utxo_file(filename: str) -> None:
     """
     Read and analyze the UTXO file.
     """
-    with open(filename, 'rb') as f:
+    with open(filename, "rb") as f:
         # Header: 55 bytes
         magic = f.read(5)
-        if magic != b'utxo\xff':
-            raise ValueError(f"Invalid magic bytes: {magic.hex()} (expected 'utxo\\xff')")
+        if magic != b"utxo\xff":
+            raise ValueError(
+                f"Invalid magic bytes: {magic.hex()} (expected 'utxo\\xff')"
+            )
 
         version_data = f.read(2)
         if len(version_data) != 2:
             raise ValueError("File too short for version")
-        version = struct.unpack('<H', version_data)[0]
+        version = struct.unpack("<H", version_data)[0]
 
         network_magic = f.read(4)
         if len(network_magic) != 4:
@@ -141,18 +161,18 @@ def read_utxo_file(filename: str) -> None:
         count_data = f.read(8)
         if len(count_data) != 8:
             raise ValueError("File too short for count")
-        num_utxos = struct.unpack('<Q', count_data)[0]
+        num_utxos = struct.unpack("<Q", count_data)[0]
 
         print(f"Format version: {version}")
         print(f"Network magic: {network_magic.hex()}")
         print(f"Base block hash: {base_hash[::-1].hex()}")
         print(f"Total UTXOs: {num_utxos:,}")
 
-        type_stats = defaultdict(lambda: {'count': 0, 'total_sat': 0})
+        type_stats = defaultdict(lambda: {"count": 0, "total_sat": 0})
         parsed_utxos = 0
 
         # Asserting
-        expected_header_start = b'utxo\xff\x02\x00\xf9\xbe\xb4\xd9'
+        expected_header_start = b"utxo\xff\x02\x00\xf9\xbe\xb4\xd9"
         actual_header_start = magic + version_data + network_magic
         if actual_header_start != expected_header_start:
             print("Warning: Header start does not match expected v30 mainnet format.")
@@ -186,10 +206,14 @@ def read_utxo_file(filename: str) -> None:
 
                 # size = read_varint(f)
                 # print(f"  script size: {size} bytes")
-                
+
                 scriptpubkey = f.read(32)
                 print(scriptpubkey.hex())
-                address = network.address.for_script(bytes.fromhex('41047a488354d9d5414de09b7121b80b973c991b76998ad68756d8cf4560c0ddcbe24ae72a77cca86f6d1d11b1b796e3f14caa5852e6d4c60e9bebedc71673b58ec0ac'))
+                address = network.address.for_script(
+                    bytes.fromhex(
+                        "41047a488354d9d5414de09b7121b80b973c991b76998ad68756d8cf4560c0ddcbe24ae72a77cca86f6d1d11b1b796e3f14caa5852e6d4c60e9bebedc71673b58ec0ac"
+                    )
+                )
                 print(f"  address: {address}")
                 # intersting = read_scriptpubkey(f)
 
@@ -237,16 +261,19 @@ def read_utxo_file(filename: str) -> None:
         print("-" * 44)
         total_btc = 0
         for utxo_type, stats in sorted(type_stats.items()):
-            balance_btc = stats['total_sat'] / 100_000_000.0
+            balance_btc = stats["total_sat"] / 100_000_000.0
             total_btc += balance_btc
             print(f"{utxo_type:<12} {stats['count']:<12,} {balance_btc:<20.8f}")
 
         print("-" * 44)
         print(f"{'GRAND TOTAL':<12} {num_utxos:<12,} {total_btc:<20.8f}")
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Analyze Bitcoin UTXO dump file.")
-    parser.add_argument("filename", help="Path to utxo.dat file (e.g., utxo-880000.dat)")
+    parser.add_argument(
+        "filename", help="Path to utxo.dat file (e.g., utxo-880000.dat)"
+    )
     args = parser.parse_args()
 
     try:

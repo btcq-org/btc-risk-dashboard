@@ -23,8 +23,13 @@ def detect_script_type(spk: Dict[str, Any]) -> Optional[str]:
         "op_return": "OP_RETURN",
         "nonstandard": "nonstandard",
         # Passthrough when type is already our label (e.g. from BLK get_script_type)
-        "P2PK": "P2PK", "P2PKH": "P2PKH", "P2SH": "P2SH", "P2MS": "P2MS",
-        "P2WPKH": "P2WPKH", "P2WSH": "P2WSH", "P2TR": "P2TR",
+        "P2PK": "P2PK",
+        "P2PKH": "P2PKH",
+        "P2SH": "P2SH",
+        "P2MS": "P2MS",
+        "P2WPKH": "P2WPKH",
+        "P2WSH": "P2WSH",
+        "P2TR": "P2TR",
     }
 
     return script_type_map.get(t, "nonstandard")
@@ -62,9 +67,17 @@ def get_script_type(script_hex: str, address: str) -> str:
 
     def disassemble():
         opcodes = {
-            0x76: 'OP_DUP', 0xa9: 'OP_HASH160', 0x88: 'OP_EQUALVERIFY', 0xac: 'OP_CHECKSIG',
-            0x87: 'OP_EQUAL', 0x51: 'OP_1', 0x52: 'OP_2', 0x53: 'OP_3', 0xae: 'OP_CHECKMULTISIG',
-            0x00: 'OP_0', 0x01: 'OP_1'
+            0x76: "OP_DUP",
+            0xA9: "OP_HASH160",
+            0x88: "OP_EQUALVERIFY",
+            0xAC: "OP_CHECKSIG",
+            0x87: "OP_EQUAL",
+            0x51: "OP_1",
+            0x52: "OP_2",
+            0x53: "OP_3",
+            0xAE: "OP_CHECKMULTISIG",
+            0x00: "OP_0",
+            0x01: "OP_1",
         }
         # OP_PUSHDATA1 = 0x4c, OP_PUSHDATA2 = 0x4d (needed for P2PK with non-minimal push)
         disasm = []
@@ -75,80 +88,90 @@ def get_script_type(script_hex: str, address: str) -> str:
             if 1 <= op <= 75:
                 data_len = op
                 if i + data_len > len(script):
-                    return ['ERROR']
-                data_hex = script[i:i + data_len].hex()
-                disasm.append(f'PUSH_{data_len}:{data_hex}')
+                    return ["ERROR"]
+                data_hex = script[i : i + data_len].hex()
+                disasm.append(f"PUSH_{data_len}:{data_hex}")
                 i += data_len
-            elif op == 0x4c:  # OP_PUSHDATA1
+            elif op == 0x4C:  # OP_PUSHDATA1
                 if i >= len(script):
-                    return ['ERROR']
+                    return ["ERROR"]
                 data_len = script[i]
                 i += 1
                 if i + data_len > len(script):
-                    return ['ERROR']
-                data_hex = script[i:i + data_len].hex()
-                disasm.append(f'PUSH_{data_len}:{data_hex}')
+                    return ["ERROR"]
+                data_hex = script[i : i + data_len].hex()
+                disasm.append(f"PUSH_{data_len}:{data_hex}")
                 i += data_len
-            elif op == 0x4d:  # OP_PUSHDATA2
+            elif op == 0x4D:  # OP_PUSHDATA2
                 if i + 2 > len(script):
-                    return ['ERROR']
+                    return ["ERROR"]
                 data_len = script[i] | (script[i + 1] << 8)
                 i += 2
                 if i + data_len > len(script):
-                    return ['ERROR']
-                data_hex = script[i:i + data_len].hex()
-                disasm.append(f'PUSH_{data_len}:{data_hex}')
+                    return ["ERROR"]
+                data_hex = script[i : i + data_len].hex()
+                disasm.append(f"PUSH_{data_len}:{data_hex}")
                 i += data_len
             else:
-                name = opcodes.get(op, f'OP_{op:02x}')
+                name = opcodes.get(op, f"OP_{op:02x}")
                 disasm.append(name)
         return disasm
 
     disasm = disassemble()
 
-    if (len(disasm) == 5 and
-        disasm[0] == 'OP_DUP' and
-        disasm[1] == 'OP_HASH160' and
-        disasm[2].startswith('PUSH_20:') and
-        disasm[3] == 'OP_EQUALVERIFY' and
-        disasm[4] == 'OP_CHECKSIG'):
-        return 'P2PKH'
+    if (
+        len(disasm) == 5
+        and disasm[0] == "OP_DUP"
+        and disasm[1] == "OP_HASH160"
+        and disasm[2].startswith("PUSH_20:")
+        and disasm[3] == "OP_EQUALVERIFY"
+        and disasm[4] == "OP_CHECKSIG"
+    ):
+        return "P2PKH"
 
-    if (len(disasm) == 3 and
-        disasm[0] == 'OP_HASH160' and
-        disasm[1].startswith('PUSH_20:') and
-        disasm[2] == 'OP_EQUAL'):
-        return 'P2SH'
+    if (
+        len(disasm) == 3
+        and disasm[0] == "OP_HASH160"
+        and disasm[1].startswith("PUSH_20:")
+        and disasm[2] == "OP_EQUAL"
+    ):
+        return "P2SH"
 
-    if (len(disasm) == 2 and
-        disasm[0] == 'OP_0' and
-        disasm[1].startswith('PUSH_20:')):
-        return 'P2WPKH'
+    if len(disasm) == 2 and disasm[0] == "OP_0" and disasm[1].startswith("PUSH_20:"):
+        return "P2WPKH"
 
-    if (len(disasm) == 2 and
-        disasm[0] == 'OP_0' and
-        disasm[1].startswith('PUSH_32:')):
-        return 'P2WSH'
+    if len(disasm) == 2 and disasm[0] == "OP_0" and disasm[1].startswith("PUSH_32:"):
+        return "P2WSH"
 
-    if (len(disasm) == 2 and
-        disasm[0] == 'OP_1' and
-        disasm[1].startswith('PUSH_32:')):
-        return 'P2TR'
+    if len(disasm) == 2 and disasm[0] == "OP_1" and disasm[1].startswith("PUSH_32:"):
+        return "P2TR"
 
     # P2PK: one push of 33 or 65 bytes (compressed/uncompressed pubkey) then OP_CHECKSIG.
     # Push can be minimal (opcode 33/65) or OP_PUSHDATA1 (disasm length 3).
-    if disasm and disasm[-1] == 'OP_CHECKSIG':
-        push_elem = disasm[0] if len(disasm) == 2 else (disasm[1] if len(disasm) == 3 else None)
-        if push_elem and (push_elem.startswith('PUSH_33:') or push_elem.startswith('PUSH_65:')):
-            return 'P2PK'
+    if disasm and disasm[-1] == "OP_CHECKSIG":
+        push_elem = (
+            disasm[0] if len(disasm) == 2 else (disasm[1] if len(disasm) == 3 else None)
+        )
+        if push_elem and (
+            push_elem.startswith("PUSH_33:") or push_elem.startswith("PUSH_65:")
+        ):
+            return "P2PK"
 
-    if (len(disasm) >= 4 and disasm[-1] == 'OP_CHECKMULTISIG' and
-        disasm[-2] in ['OP_1', 'OP_2', 'OP_3'] and disasm[0] in ['OP_1', 'OP_2', 'OP_3']):
-        pubkey_pushes = [d for d in disasm[1:-2] if d.startswith('PUSH_33:') or d.startswith('PUSH_65:')]
+    if (
+        len(disasm) >= 4
+        and disasm[-1] == "OP_CHECKMULTISIG"
+        and disasm[-2] in ["OP_1", "OP_2", "OP_3"]
+        and disasm[0] in ["OP_1", "OP_2", "OP_3"]
+    ):
+        pubkey_pushes = [
+            d
+            for d in disasm[1:-2]
+            if d.startswith("PUSH_33:") or d.startswith("PUSH_65:")
+        ]
         if len(pubkey_pushes) >= 2:
-            return 'P2MS'
+            return "P2MS"
 
-    if address.startswith('bc1p'):
-        return 'Bech32'
+    if address.startswith("bc1p"):
+        return "Bech32"
 
-    return 'unknown'
+    return "unknown"

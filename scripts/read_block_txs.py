@@ -9,6 +9,7 @@ Usage:
   python scripts/read_block_txs.py --height 9444 --blocks-dir /path/to/blocks --index-dir ./data/index
   python scripts/read_block_txs.py --height 9444 --block-hash 00000000...
 """
+
 import os
 import sys
 import argparse
@@ -21,9 +22,15 @@ def get_block_hash_rpc(height: int):
     try:
         import requests
         from indexer import config
+
         url = config.RPC_URL
         auth = (config.RPC_USER, config.RPC_PASSWORD)
-        payload = {"jsonrpc": "1.0", "id": "read_txs", "method": "getblockhash", "params": [height]}
+        payload = {
+            "jsonrpc": "1.0",
+            "id": "read_txs",
+            "method": "getblockhash",
+            "params": [height],
+        }
         r = requests.post(url, json=payload, auth=auth, timeout=10)
         r.raise_for_status()
         data = r.json()
@@ -34,7 +41,9 @@ def get_block_hash_rpc(height: int):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Read transactions for a block at a given height from blk files")
+    parser = argparse.ArgumentParser(
+        description="Read transactions for a block at a given height from blk files"
+    )
     parser.add_argument(
         "--height",
         type=int,
@@ -44,7 +53,9 @@ def main():
     )
     parser.add_argument(
         "--blocks-dir",
-        default=os.path.expanduser(os.environ.get("BLOCKS_DIR", "~/data-bitcoin/blocks")),
+        default=os.path.expanduser(
+            os.environ.get("BLOCKS_DIR", "~/data-bitcoin/blocks")
+        ),
         help="Path to blocks directory",
     )
     parser.add_argument(
@@ -58,7 +69,8 @@ def main():
         help="Block hash (64 hex chars). If set, skip RPC.",
     )
     parser.add_argument(
-        "--verbose", "-v",
+        "--verbose",
+        "-v",
         action="store_true",
         help="Print input prev_out and full script types",
     )
@@ -83,17 +95,23 @@ def main():
     # Block hash
     if args.block_hash:
         block_hash = args.block_hash.strip().lower()
-        if len(block_hash) != 64 or not all(c in "0123456789abcdef" for c in block_hash):
+        if len(block_hash) != 64 or not all(
+            c in "0123456789abcdef" for c in block_hash
+        ):
             print("Error: --block-hash must be 64 hex characters.", file=sys.stderr)
             sys.exit(1)
     else:
         block_hash = get_block_hash_rpc(height)
         if not block_hash:
-            print("Cannot get block hash without RPC. Set RPC_* or use --block-hash.", file=sys.stderr)
+            print(
+                "Cannot get block hash without RPC. Set RPC_* or use --block-hash.",
+                file=sys.stderr,
+            )
             sys.exit(1)
 
     # Block location from index
     from indexer.core_block_index import diagnose_block_index, blk_path_from_file_number
+
     loc_result, diag = diagnose_block_index(index_path, block_hash)
     if loc_result is None:
         print("Block index lookup failed:", diag, file=sys.stderr)
@@ -107,6 +125,7 @@ def main():
     # Read block (n_data_pos is offset of payload; magic+size are 8 bytes before)
     from indexer.test_blk import read_block, read_xor_key_from_file
     from indexer.core_block_index import BLOCK_FILE_HEADER_SIZE
+
     xor_key = read_xor_key_from_file(blocks_dir)
     with open(blk_path, "rb") as f:
         f.seek(n_data_pos - BLOCK_FILE_HEADER_SIZE)
@@ -131,7 +150,9 @@ def main():
         print(f"--- Tx #{i} (inputs={n_in}, outputs={n_out}) ---")
         if args.verbose:
             for j, inp in enumerate(tx.get("inputs", [])):
-                print(f"  In[{j}]:  {inp.get('prev_tx_hash', '')[:16]}...:{inp.get('prev_output_index')}")
+                print(
+                    f"  In[{j}]:  {inp.get('prev_tx_hash', '')[:16]}...:{inp.get('prev_output_index')}"
+                )
         total_out = 0
         for j, out in enumerate(tx.get("outputs", [])):
             val = out.get("value", 0)

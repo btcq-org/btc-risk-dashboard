@@ -3,6 +3,7 @@ Central configuration for the btcq-indexer project.
 All settings can be overridden via environment variables.
 See project root .env.example for a full list of variables.
 """
+
 import os
 
 # ---------------------------------------------------------------------------

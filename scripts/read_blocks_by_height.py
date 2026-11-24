@@ -10,6 +10,7 @@ Usage:
 
 Requires plyvel and a block index (use BLOCK_INDEX_DIR or --index-dir if Core holds the lock).
 """
+
 import os
 import sys
 import struct
@@ -18,10 +19,15 @@ import argparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from indexer.test_blk import read_xor_key_from_file, apply_xor
-from indexer.core_block_index import iter_block_index_by_height, blk_path_from_file_number
+from indexer.core_block_index import (
+    iter_block_index_by_height,
+    blk_path_from_file_number,
+)
 
 
-def read_block_size_at(blocks_dir: str, n_file: int, n_data_pos: int, xor_key: bytes) -> int:
+def read_block_size_at(
+    blocks_dir: str, n_file: int, n_data_pos: int, xor_key: bytes
+) -> int:
     """Read the 4-byte block size. n_data_pos is offset of block payload; size is at n_data_pos - 4."""
     path = blk_path_from_file_number(blocks_dir, n_file)
     if not os.path.isfile(path):
@@ -38,10 +44,14 @@ def read_block_size_at(blocks_dir: str, n_file: int, n_data_pos: int, xor_key: b
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Read blocks from blk files by height, print height and size")
+    parser = argparse.ArgumentParser(
+        description="Read blocks from blk files by height, print height and size"
+    )
     parser.add_argument(
         "--blocks-dir",
-        default=os.path.expanduser(os.environ.get("BLOCKS_DIR", "~/data-bitcoin/blocks")),
+        default=os.path.expanduser(
+            os.environ.get("BLOCKS_DIR", "~/data-bitcoin/blocks")
+        ),
         help="Path to blocks directory",
     )
     parser.add_argument(
@@ -75,12 +85,18 @@ def main():
         index_path = os.path.abspath(os.path.expanduser(index_path))
     if not os.path.isdir(index_path):
         print("Error: index path not found:", index_path, file=sys.stderr)
-        print("Use a copy of blocks/index if Bitcoin Core is running (e.g. BLOCK_INDEX_DIR=./data/index)", file=sys.stderr)
+        print(
+            "Use a copy of blocks/index if Bitcoin Core is running (e.g. BLOCK_INDEX_DIR=./data/index)",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     xor_key = read_xor_key_from_file(blocks_dir)
     if not xor_key:
-        print("Warning: no xor.dat; block sizes may be wrong if files are obfuscated", file=sys.stderr)
+        print(
+            "Warning: no xor.dat; block sizes may be wrong if files are obfuscated",
+            file=sys.stderr,
+        )
 
     try:
         import plyvel  # noqa: F401  (only checks that plyvel is installed)

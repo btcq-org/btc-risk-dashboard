@@ -14,6 +14,7 @@ DB_PASS = config.DB_PASS
 # Connection pool (min=1, max=20 connections)
 _pool = None
 
+
 def init_pool():
     """Initialize the connection pool. Call this once at startup."""
     global _pool
@@ -25,8 +26,9 @@ def init_pool():
             port=DB_PORT,
             dbname=DB_NAME,
             user=DB_USER,
-            password=DB_PASS
+            password=DB_PASS,
         )
+
 
 def shutdown_pool():
     """Close all pool connections. Call before exit."""
@@ -34,6 +36,7 @@ def shutdown_pool():
     if _pool is not None:
         _pool.closeall()
         _pool = None
+
 
 @contextmanager
 def get_db_cursor(cursor_factory=None):
@@ -56,6 +59,7 @@ def get_db_cursor(cursor_factory=None):
     finally:
         if conn is not None:
             _pool.putconn(conn)
+
 
 # Initialize pool on module import
 init_pool()
