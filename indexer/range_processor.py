@@ -5,11 +5,10 @@ Supports processing blocks in chunks using different block readers (RPC or BLK f
 """
 import time
 from collections import defaultdict
-from typing import Dict, List, Any, Callable, Optional
+from typing import Dict, Callable, Optional
 
 from . import db
 from .block_data import _extract_block_data
-from .utils import detect_script_type, address_from_vout
 from .block_reader import BlockReader
 from .test_blk import ShutdownRequested
 

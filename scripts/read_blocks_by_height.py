@@ -18,7 +18,7 @@ import argparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from indexer.test_blk import read_xor_key_from_file, apply_xor
-from indexer.core_block_index import iter_block_index_by_height, blk_path_from_file_number, BLOCK_FILE_HEADER_SIZE
+from indexer.core_block_index import iter_block_index_by_height, blk_path_from_file_number
 
 
 def read_block_size_at(blocks_dir: str, n_file: int, n_data_pos: int, xor_key: bytes) -> int:
@@ -83,7 +83,7 @@ def main():
         print("Warning: no xor.dat; block sizes may be wrong if files are obfuscated", file=sys.stderr)
 
     try:
-        import plyvel
+        import plyvel  # noqa: F401  (only checks that plyvel is installed)
     except ImportError:
         print("Error: plyvel required. pip install plyvel", file=sys.stderr)
         sys.exit(1)

@@ -11,7 +11,6 @@ Usage:
 import os
 import sys
 import struct
-import hashlib
 import argparse
 
 # Run from repo root so indexer is importable
@@ -158,7 +157,6 @@ def main():
     if args.height is not None:
         print(f"\n--- RPC getblockhash({args.height}) ---")
         try:
-            import json
             import requests
             from indexer import config
             url = config.RPC_URL

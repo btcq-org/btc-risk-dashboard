@@ -15,11 +15,10 @@ header), not the magic. So the on-disk layout is: [magic 4][size 4][payload...];
 at (n_data_pos - 8).
 """
 import os
+from typing import Optional, Tuple
 
 # Bytes before block payload in blk file: magic (4) + size (4). n_data_pos points at payload start.
 BLOCK_FILE_HEADER_SIZE = 8
-import struct
-from typing import Optional, Tuple
 
 # Status flags from Bitcoin Core chain.h
 BLOCK_HAVE_DATA = 8   # full block available in blk*.dat

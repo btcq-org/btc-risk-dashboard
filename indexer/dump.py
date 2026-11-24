@@ -19,9 +19,6 @@ import argparse
 import struct
 import sys
 from collections import defaultdict
-from typing import Dict
-from bitcoin.core import CScript
-from bitcoin.wallet import CBitcoinAddress
 from bitcoin import SelectParams
 from pycoin.symbols.btc import network
 
@@ -158,7 +155,7 @@ def read_utxo_file(filename: str) -> None:
         expected_header_start = b'utxo\xff\x02\x00\xf9\xbe\xb4\xd9'
         actual_header_start = magic + version_data + network_magic
         if actual_header_start != expected_header_start:
-            print(f"Warning: Header start does not match expected v30 mainnet format.")
+            print("Warning: Header start does not match expected v30 mainnet format.")
             print(f"Expected: {expected_header_start.hex()}")
             print(f"Actual:   {actual_header_start.hex()}")
 
@@ -182,7 +179,7 @@ def read_utxo_file(filename: str) -> None:
                 print(f"Reading {txid_bytes[::-1].hex()} output {i}")
 
                 height = read_compactsize(f)
-                code = f.read(3)
+                f.read(3)  # skip the 3-byte code field
                 amount = decompress_amount(read_varint(f))
 
                 print(f"  height: {height}, amount: {amount} satoshis")

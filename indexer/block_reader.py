@@ -15,7 +15,7 @@ from io import BytesIO
 try:
     from .test_blk import (
         read_block, read_blk_file, read_xor_key_from_file, find_bitcoin_folder,
-        read_varint, apply_xor, ShutdownRequested
+        ShutdownRequested
     )
     from .core_block_index import get_block_location, get_block_location_from_db, blk_path_from_file_number, BLOCK_FILE_HEADER_SIZE
 except ImportError:
@@ -24,7 +24,7 @@ except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from indexer.test_blk import (
         read_block, read_blk_file, read_xor_key_from_file, find_bitcoin_folder,
-        read_varint, apply_xor, ShutdownRequested
+        ShutdownRequested
     )
     from indexer.core_block_index import get_block_location, get_block_location_from_db, blk_path_from_file_number, BLOCK_FILE_HEADER_SIZE
 
@@ -403,7 +403,7 @@ class BLKFileReader:
         # Read XOR key if available
         self.xor_key = read_xor_key_from_file(self.blocks_dir)
         if self.xor_key:
-            print(f"BLK Reader: Loaded XOR key from xor.dat")
+            print("BLK Reader: Loaded XOR key from xor.dat")
         
         # RPC functions for getting block hashes (minimal RPC usage)
         self.rpc_call = rpc_call

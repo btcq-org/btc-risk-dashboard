@@ -118,7 +118,7 @@ def read_tx(f, xor_key: bytes = None) -> Dict[str, Any]:
             
             # Detect script type
             script_type = get_script_type(script_hex, address or "")
-        except Exception as e:
+        except Exception:
             script_type = "unknown"
         
         outputs.append({
@@ -142,12 +142,7 @@ def read_tx(f, xor_key: bytes = None) -> Dict[str, Any]:
     
     # Locktime (4 bytes, little-endian)
     locktime = struct.unpack('<I', f.read(4))[0]
-    
-    # Calculate transaction hash (we'd need to hash the raw tx, but for now just note the position)
     tx_end_pos = f.tell()
-    f.seek(tx_start_pos)
-    tx_raw = f.read(tx_end_pos - tx_start_pos)
-    f.seek(tx_end_pos)
     
     return {
         'version': version,
@@ -260,7 +255,7 @@ def read_block(f, xor_key: bytes = None, shutdown_check: Optional[Callable[[], b
         deobfuscated_value_rev_be = struct.unpack('>I', deobfuscated_magic_rev)[0]
         
         # Debug output
-        print(f"Debug XOR detection:")
+        print("Debug XOR detection:")
         print(f"  Obfuscated magic: {magic_bytes_raw.hex()}")
         print(f"  Detected key (4 bytes): {detected_key[:4].hex()}")
         print(f"  Detected key (8 bytes): {detected_key.hex()}")
@@ -335,7 +330,7 @@ def read_block(f, xor_key: bytes = None, shutdown_check: Optional[Callable[[], b
             block_size = struct.unpack('<I', block_size_raw)[0]  # restore for error message
         if block_size == 0 or block_size > max_sane_size:
             print(f"[BLK] Warning: Invalid block size: {block_size} bytes (raw: {block_size_raw.hex()})")
-            print(f"[BLK] Likely obfuscation or wrong position; skipping rest of file.")
+            print("[BLK] Likely obfuscation or wrong position; skipping rest of file.")
             return None
     
     block_start = f.tell()
@@ -377,7 +372,6 @@ def read_block(f, xor_key: bytes = None, shutdown_check: Optional[Callable[[], b
         # Return partial block for debugging
         pass
     
-    block_end = f.tell()
     actual_size = block_size
     
     result = {
@@ -589,7 +583,7 @@ Examples:
     xor_key = read_xor_key_from_file(blocks_folder)
     if xor_key:
         print(f"✓ Read XOR key from xor.dat: {xor_key.hex()}")
-        print(f"  Note: XOR obfuscation starts at offset 8 (after magic bytes + block size)")
+        print("  Note: XOR obfuscation starts at offset 8 (after magic bytes + block size)")
     else:
         print("⚠ xor.dat file not found, will try to detect XOR key from magic bytes")
         xor_key = None
@@ -669,7 +663,7 @@ Examples:
             print(f"  Size: {tx['size']:,} bytes")
             
             # Show first few inputs
-            print(f"\n  Inputs:")
+            print("\n  Inputs:")
             for i, inp in enumerate(tx['inputs'][:3]):
                 print(f"    Input {i + 1}:")
                 print(f"      Previous TX: {inp['prev_tx_hash']}")
@@ -680,7 +674,7 @@ Examples:
                 print(f"    ... and {len(tx['inputs']) - 3} more inputs")
             
             # Show first few outputs
-            print(f"\n  Outputs:")
+            print("\n  Outputs:")
             for i, out in enumerate(tx['outputs'][:3]):
                 print(f"    Output {i + 1}:")
                 print(f"      Value: {out['value']:,} satoshis ({out['value'] / 100000000:.8f} BTC)")
@@ -698,7 +692,7 @@ Examples:
                 script_type = out.get('script_type', 'unknown')
                 script_types[script_type] = script_types.get(script_type, 0) + 1
             if script_types:
-                print(f"\n  Script Type Summary:")
+                print("\n  Script Type Summary:")
                 for script_type, count in sorted(script_types.items()):
                     print(f"    {script_type}: {count}")
         

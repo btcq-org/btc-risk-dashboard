@@ -9,13 +9,12 @@ Runs address.sql to create tables, then:
 5. Updates address_stats after address_status is complete
 """
 import os
-from typing import Set
 from psycopg2.extras import execute_values, RealDictCursor
 from pycoin.symbols.btc import network
 
 from . import config
 from . import db
-from .main import rpc_call, rpc_batch_call, RPCBatchError
+from .main import rpc_batch_call, RPCBatchError
 from .utils import detect_script_type, address_from_vout
 
 DB_PAGE_ROWS = config.DB_PAGE_ROWS
@@ -23,7 +22,6 @@ DB_PAGE_ROWS = config.DB_PAGE_ROWS
 
 def schema_init():
     """Initialize address tables by running address.sql"""
-    import os
     schema_path = os.path.join(os.path.dirname(__file__), "db", "address.sql")
     
     db.init_pool()
@@ -530,7 +528,7 @@ def calculate_address_stats():
         """)
         
         stats_rows = cur.fetchall()
-        print(f"\nAddress stats updated:")
+        print("\nAddress stats updated:")
         print(f"{'Script Type':<15} {'Reused':<10} {'Total':<10} {'Reused Sat':<15} {'Total Sat':<15}")
         print("-" * 70)
         for row in stats_rows:

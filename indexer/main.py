@@ -21,7 +21,7 @@ from psycopg2.extras import execute_values
 from . import config
 from . import db
 from .block_data import _extract_block_data as _extract_block_data_core
-from .utils import detect_script_type, address_from_vout, get_script_type
+from .utils import get_script_type
 
 # ========================
 # CONFIGURATION (from indexer.config)
@@ -56,22 +56,22 @@ def test_rpc_connection():
     except requests.exceptions.ConnectionError as e:
         print(f"✗ Failed to connect to Bitcoin RPC at {RPC_URL}")
         print(f"  Error: {e}")
-        print(f"\n  Troubleshooting steps:")
-        print(f"  1. Ensure Bitcoin Core is running")
-        print(f"  2. Check that RPC is enabled in bitcoin.conf:")
+        print("\n  Troubleshooting steps:")
+        print("  1. Ensure Bitcoin Core is running")
+        print("  2. Check that RPC is enabled in bitcoin.conf:")
         print(f"     - rpcuser={RPC_USER}")
         print(f"     - rpcpassword={RPC_PASSWORD}")
         print(f"     - rpcport={RPC_PORT}")
-        print(f"     - rpcallowip=127.0.0.1 (or 0.0.0.0/0 for all)")
-        print(f"     - rpcbind=127.0.0.1 (or 0.0.0.0 for all)")
-        print(f"  3. If using Docker, ensure the container is running:")
-        print(f"     docker ps | grep bitcoind")
-        print(f"  4. Verify the port is correct (18332 for testnet, 8332 for mainnet)")
-        print(f"  5. Check firewall settings")
+        print("     - rpcallowip=127.0.0.1 (or 0.0.0.0/0 for all)")
+        print("     - rpcbind=127.0.0.1 (or 0.0.0.0 for all)")
+        print("  3. If using Docker, ensure the container is running:")
+        print("     docker ps | grep bitcoind")
+        print("  4. Verify the port is correct (18332 for testnet, 8332 for mainnet)")
+        print("  5. Check firewall settings")
         return False
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 401:
-            print(f"✗ Authentication failed. Check RPC_USER and RPC_PASSWORD.")
+            print("✗ Authentication failed. Check RPC_USER and RPC_PASSWORD.")
             print(f"  Current settings: user={RPC_USER}, password={'*' * len(RPC_PASSWORD)}")
         else:
             print(f"✗ HTTP error: {e}")
@@ -867,7 +867,7 @@ def read_utxo(height: int = 840_000, batch_size: int = 1_000_000):
                 if len(batch) >= batch_size:
                     print(f"Reading batch of {len(batch)} rows..., Read CSV batch in {time.time() - read_start}s", file=sys.stderr)
                     if shutdown_requested:
-                        print(f"Shutdown requested, stopping UTXO import", file=sys.stderr)
+                        print("Shutdown requested, stopping UTXO import", file=sys.stderr)
                         break
                     print(f"Inserting batch of {len(batch)} rows...", file=sys.stderr)
                     insert_start = time.time()

@@ -44,7 +44,6 @@ def read_test_blocks(blocks_folder_path):
         block_count = 0
         max_blocks = 100
         first_block_time = None
-        last_progress_time = time.time()
         
         # Use a generator with progress feedback
         block_iterator = blockchain.get_unordered_blocks()

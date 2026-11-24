@@ -1,9 +1,7 @@
 """Shared database connection handling for quantum-at-risk indexer."""
 
 from contextlib import contextmanager
-import psycopg2
 from psycopg2.pool import ThreadedConnectionPool
-from psycopg2.extras import RealDictCursor, execute_values
 
 from . import config
 
