@@ -8,10 +8,10 @@ Usage:
   python scripts/verify_blk_first_block.py [--blocks-dir /path/to/blocks] [--file blk00001.dat]
   BLOCKS_DIR=/root/data-bitcoin/blocks python scripts/verify_blk_first_block.py --file blk00001.dat
 """
+
 import os
 import sys
 import struct
-import hashlib
 import argparse
 
 # Run from repo root so indexer is importable
@@ -44,10 +44,14 @@ def block_hash_from_blk_block(blk_block: dict) -> str:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Verify first block of blk*.dat and hashes")
+    parser = argparse.ArgumentParser(
+        description="Verify first block of blk*.dat and hashes"
+    )
     parser.add_argument(
         "--blocks-dir",
-        default=os.path.expanduser(os.environ.get("BLOCKS_DIR", "~/data-bitcoin/blocks")),
+        default=os.path.expanduser(
+            os.environ.get("BLOCKS_DIR", "~/data-bitcoin/blocks")
+        ),
         help="Path to blocks directory (default: BLOCKS_DIR or ~/data-bitcoin/blocks)",
     )
     parser.add_argument(
@@ -128,9 +132,15 @@ def main():
         try:
             import requests
             from indexer import config
+
             url = config.RPC_URL
             auth = (config.RPC_USER, config.RPC_PASSWORD)
-            payload = {"jsonrpc": "1.0", "id": "verify", "method": "getblock", "params": [computed_hash, 1]}
+            payload = {
+                "jsonrpc": "1.0",
+                "id": "verify",
+                "method": "getblock",
+                "params": [computed_hash, 1],
+            }
             r = requests.post(url, json=payload, auth=auth, timeout=10)
             r.raise_for_status()
             data = r.json()
@@ -141,6 +151,7 @@ def main():
         if first_block_height is None:
             try:
                 from indexer.core_block_index import get_block_height
+
                 index_path = os.path.join(blocks_dir, "index")
                 first_block_height = get_block_height(index_path, computed_hash)
             except Exception:
@@ -148,7 +159,9 @@ def main():
         if first_block_height is not None:
             print(f"  First block of {name} → height: {first_block_height}")
         else:
-            print("  First block height: (could not resolve; RPC and Core index unavailable)")
+            print(
+                "  First block height: (could not resolve; RPC and Core index unavailable)"
+            )
 
         if name == "blk00000.dat" and computed_hash.lower() == genesis_hash.lower():
             print("  OK: matches known genesis block hash")
@@ -158,19 +171,26 @@ def main():
     if args.height is not None:
         print(f"\n--- RPC getblockhash({args.height}) ---")
         try:
-            import json
             import requests
             from indexer import config
+
             url = config.RPC_URL
             auth = (config.RPC_USER, config.RPC_PASSWORD)
-            payload = {"jsonrpc": "1.0", "id": "verify", "method": "getblockhash", "params": [args.height]}
+            payload = {
+                "jsonrpc": "1.0",
+                "id": "verify",
+                "method": "getblockhash",
+                "params": [args.height],
+            }
             r = requests.post(url, json=payload, auth=auth, timeout=10)
             r.raise_for_status()
             data = r.json()
             expected_hash = data.get("result")
             if expected_hash:
                 print(f"  Expected hash for height {args.height}: {expected_hash}")
-                print("  (Indexer scans blk files until it finds a block with this hash.)")
+                print(
+                    "  (Indexer scans blk files until it finds a block with this hash.)"
+                )
             else:
                 print(f"  RPC error: {data}")
         except Exception as e:

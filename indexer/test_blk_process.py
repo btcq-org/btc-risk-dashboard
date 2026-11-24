@@ -8,12 +8,15 @@ Requires:
   - BLOCKS_DIR pointing to the blocks directory (e.g. /path/to/data-bitcoin/blocks)
     containing blk*.dat with at least the first 100 blocks.
 
+Marked `integration`, so a plain `pytest` (and CI) leaves it out.
+
 Run:
-  BLOCKS_DIR=/path/to/blocks pytest indexer/test_blk_first_100.py -v
+  BLOCKS_DIR=/path/to/blocks pytest -m integration indexer/test_blk_process.py -v
   # Fewer blocks for a quick run (default 100):
-  BLK_TEST_N_BLOCKS=5 BLOCKS_DIR=/path/to/blocks pytest indexer/test_blk_first_100.py -v
-  python -m indexer.test_blk_first_100
+  BLK_TEST_N_BLOCKS=5 BLOCKS_DIR=/path/to/blocks pytest -m integration indexer/test_blk_process.py -v
+  python -m indexer.test_blk_process
 """
+
 import os
 import sys
 
@@ -36,12 +39,15 @@ FIRST_N_BLOCKS = int(os.getenv("BLK_TEST_N_BLOCKS", "100"))
 def _rpc_call(method, params=None):
     import json
     import requests
-    payload = json.dumps({
-        "jsonrpc": "1.0",
-        "id": "test-blk",
-        "method": method,
-        "params": params or [],
-    })
+
+    payload = json.dumps(
+        {
+            "jsonrpc": "1.0",
+            "id": "test-blk",
+            "method": method,
+            "params": params or [],
+        }
+    )
     resp = requests.post(
         RPC_URL,
         auth=(RPC_USER, RPC_PASSWORD),
@@ -60,6 +66,7 @@ def _rpc_batch_call(requests_list):
     """Minimal batch: list of (method, params, id). Returns dict id -> result."""
     import json
     import requests
+
     payload = [
         {
             "jsonrpc": "1.0",
@@ -79,7 +86,7 @@ def _rpc_batch_call(requests_list):
     resp.raise_for_status()
     out = resp.json()
     results = {}
-    for entry in (out if isinstance(out, list) else [out]):
+    for entry in out if isinstance(out, list) else [out]:
         err = entry.get("error")
         if err:
             raise RuntimeError(err)
@@ -100,6 +107,7 @@ def _can_run_integration():
 
 
 if pytest:
+    pytestmark = pytest.mark.integration
 
     @pytest.fixture(scope="module")
     def rpc_blocks():
@@ -119,6 +127,7 @@ if pytest:
     def blk_blocks(rpc_blocks):
         """Fetch same blocks via BLKFileReader (same as main.py BLOCK_SOURCE=blk)."""
         from .block_reader import BLKFileReader
+
         heights = list(range(FIRST_N_BLOCKS))
         reader = BLKFileReader(
             blocks_dir=BLOCKS_DIR,
@@ -135,7 +144,10 @@ def _normalize_vout_rows(vout_rows):
 
 def _vout_rows_comparable(vout_rows):
     """Compare vout rows ignoring script_type (RPC vs BLK can differ: e.g. P2PK vs nonstandard)."""
-    return sorted([(r[0], r[1], r[2], r[3], r[4], r[6], r[7]) for r in vout_rows], key=lambda r: (r[0], r[1]))
+    return sorted(
+        [(r[0], r[1], r[2], r[3], r[4], r[6], r[7]) for r in vout_rows],
+        key=lambda r: (r[0], r[1]),
+    )
 
 
 def _normalize_spend_rows(spend_rows):
@@ -162,16 +174,24 @@ if pytest:
             for height in range(FIRST_N_BLOCKS):
                 if height not in rpc_blocks or height not in blk_blocks:
                     continue
-                rpc_hash = rpc_blocks[height].get("hash") or rpc_blocks[height].get("_blockhash", "")
+                rpc_hash = rpc_blocks[height].get("hash") or rpc_blocks[height].get(
+                    "_blockhash", ""
+                )
                 blk_hash = blk_blocks[height].get("hash", "")
-                assert rpc_hash == blk_hash, f"Height {height}: RPC hash {rpc_hash} != BLK hash {blk_hash}"
+                assert rpc_hash == blk_hash, (
+                    f"Height {height}: RPC hash {rpc_hash} != BLK hash {blk_hash}"
+                )
 
         def test_blk_txids_match_rpc_per_block(self, rpc_blocks, blk_blocks):
             for height in range(FIRST_N_BLOCKS):
                 if height not in rpc_blocks or height not in blk_blocks:
                     continue
-                rpc_txids = [tx.get("txid", "") for tx in rpc_blocks[height].get("tx", [])]
-                blk_txids = [tx.get("txid", "") for tx in blk_blocks[height].get("tx", [])]
+                rpc_txids = [
+                    tx.get("txid", "") for tx in rpc_blocks[height].get("tx", [])
+                ]
+                blk_txids = [
+                    tx.get("txid", "") for tx in blk_blocks[height].get("tx", [])
+                ]
                 assert rpc_txids == blk_txids, (
                     f"Height {height}: txid list mismatch. RPC count={len(rpc_txids)}, BLK count={len(blk_txids)}"
                 )
@@ -225,8 +245,12 @@ if pytest:
 def main():
     """Run the same checks as a script (no pytest)."""
     if not _can_run_integration():
-        print("Skipping: set BLOCKS_DIR and ensure Bitcoin RPC has at least 100 blocks.")
-        print("  Example: BLOCKS_DIR=/root/data-bitcoin/blocks python -m indexer.test_blk_first_100")
+        print(
+            "Skipping: set BLOCKS_DIR and ensure Bitcoin RPC has at least 100 blocks."
+        )
+        print(
+            "  Example: BLOCKS_DIR=/root/data-bitcoin/blocks python -m indexer.test_blk_process"
+        )
         sys.exit(0)
 
     from .block_reader import BLKFileReader
@@ -242,7 +266,9 @@ def main():
 
     hash_reqs = [("getblockhash", [h], h) for h in heights]
     hashes = _rpc_batch_call(hash_reqs)
-    block_reqs = [("getblock", [hashes[h], 2], h) for h in heights if h in hashes and hashes[h]]
+    block_reqs = [
+        ("getblock", [hashes[h], 2], h) for h in heights if h in hashes and hashes[h]
+    ]
     rpc_blocks = _rpc_batch_call(block_reqs)
 
     errors = []
@@ -258,16 +284,22 @@ def main():
             errors.append(f"Height {height}: hash mismatch")
         rpc_data = _extract_block_data(rpc_block, height, blockhash)
         blk_data = _extract_block_data(blk_block, height, blockhash)
-        if _normalize_vout_rows(rpc_data["vout_rows"]) != _normalize_vout_rows(blk_data["vout_rows"]):
+        if _normalize_vout_rows(rpc_data["vout_rows"]) != _normalize_vout_rows(
+            blk_data["vout_rows"]
+        ):
             errors.append(f"Height {height}: vout_rows differ")
-        if _normalize_spend_rows(rpc_data["spend_rows"]) != _normalize_spend_rows(blk_data["spend_rows"]):
+        if _normalize_spend_rows(rpc_data["spend_rows"]) != _normalize_spend_rows(
+            blk_data["spend_rows"]
+        ):
             errors.append(f"Height {height}: spend_rows differ")
 
     if errors:
         for e in errors:
             print("FAIL:", e)
         sys.exit(1)
-    print(f"OK: First {FIRST_N_BLOCKS} blocks consumed via BLK match RPC (hashes, txids, vout_rows, spend_rows).")
+    print(
+        f"OK: First {FIRST_N_BLOCKS} blocks consumed via BLK match RPC (hashes, txids, vout_rows, spend_rows)."
+    )
 
 
 if __name__ == "__main__":

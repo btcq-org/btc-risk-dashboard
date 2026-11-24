@@ -10,6 +10,7 @@ Usage:
   python scripts/find_blk_by_height.py --height 9444 --blocks-dir /path/to/blocks
   BLOCK_INDEX_DIR=/path/to/index-copy python scripts/find_blk_by_height.py --height 9444
 """
+
 import os
 import sys
 import argparse
@@ -22,9 +23,15 @@ def get_block_hash_rpc(height: int):
     try:
         import requests
         from indexer import config
+
         url = config.RPC_URL
         auth = (config.RPC_USER, config.RPC_PASSWORD)
-        payload = {"jsonrpc": "1.0", "id": "find", "method": "getblockhash", "params": [height]}
+        payload = {
+            "jsonrpc": "1.0",
+            "id": "find",
+            "method": "getblockhash",
+            "params": [height],
+        }
         r = requests.post(url, json=payload, auth=auth, timeout=10)
         r.raise_for_status()
         data = r.json()
@@ -35,7 +42,9 @@ def get_block_hash_rpc(height: int):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Find which blk*.dat file contains a block at the given height")
+    parser = argparse.ArgumentParser(
+        description="Find which blk*.dat file contains a block at the given height"
+    )
     parser.add_argument(
         "--height",
         type=int,
@@ -45,7 +54,9 @@ def main():
     )
     parser.add_argument(
         "--blocks-dir",
-        default=os.path.expanduser(os.environ.get("BLOCKS_DIR", "~/data-bitcoin/blocks")),
+        default=os.path.expanduser(
+            os.environ.get("BLOCKS_DIR", "~/data-bitcoin/blocks")
+        ),
         help="Path to blocks directory",
     )
     parser.add_argument(
@@ -70,7 +81,9 @@ def main():
     # 1) Get block hash (RPC or --block-hash)
     if args.block_hash:
         block_hash = args.block_hash.strip()
-        if len(block_hash) != 64 or not all(c in "0123456789abcdefABCDEF" for c in block_hash):
+        if len(block_hash) != 64 or not all(
+            c in "0123456789abcdefABCDEF" for c in block_hash
+        ):
             print("Error: --block-hash must be 64 hex characters.")
             sys.exit(1)
         block_hash = block_hash.lower()
@@ -78,7 +91,9 @@ def main():
     else:
         block_hash = get_block_hash_rpc(height)
         if not block_hash:
-            print("Cannot get block hash without RPC. Set RPC_* env or run bitcoind with RPC enabled.")
+            print(
+                "Cannot get block hash without RPC. Set RPC_* env or run bitcoind with RPC enabled."
+            )
             sys.exit(1)
         print(f"Block height {height} → hash: {block_hash}")
 
@@ -96,7 +111,9 @@ def main():
     n_file, n_data_pos = loc
     blk_name = f"blk{n_file:05d}.dat"
     blk_path = blk_path_from_file_number(blocks_dir, n_file)
-    print(f"Block height {height} is in: {blk_name} at file offset {n_data_pos} (0x{n_data_pos:x})")
+    print(
+        f"Block height {height} is in: {blk_name} at file offset {n_data_pos} (0x{n_data_pos:x})"
+    )
     print(f"Full path: {blk_path}")
     if not os.path.isfile(blk_path):
         print(f"Warning: file not found at {blk_path}")

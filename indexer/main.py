@@ -3,6 +3,7 @@
 Bitcoin UTXO indexer - extracts VOUTs (UTXOs) from Bitcoin blocks
 and stores them in PostgreSQL for efficient querying.
 """
+
 from bitcoin import SelectParams
 
 import json
@@ -21,7 +22,7 @@ from psycopg2.extras import execute_values
 from . import config
 from . import db
 from .block_data import _extract_block_data as _extract_block_data_core
-from .utils import detect_script_type, address_from_vout, get_script_type
+from .utils import get_script_type
 
 # ========================
 # CONFIGURATION (from indexer.config)
@@ -44,6 +45,7 @@ IS_UTXO = config.IS_UTXO
 IS_RECALC = config.IS_RECALC
 STOP_AT_HEIGHT = config.STOP_AT_HEIGHT
 
+
 # ========================
 # RPC UTILS
 # ========================
@@ -56,23 +58,25 @@ def test_rpc_connection():
     except requests.exceptions.ConnectionError as e:
         print(f"✗ Failed to connect to Bitcoin RPC at {RPC_URL}")
         print(f"  Error: {e}")
-        print(f"\n  Troubleshooting steps:")
-        print(f"  1. Ensure Bitcoin Core is running")
-        print(f"  2. Check that RPC is enabled in bitcoin.conf:")
+        print("\n  Troubleshooting steps:")
+        print("  1. Ensure Bitcoin Core is running")
+        print("  2. Check that RPC is enabled in bitcoin.conf:")
         print(f"     - rpcuser={RPC_USER}")
         print(f"     - rpcpassword={RPC_PASSWORD}")
         print(f"     - rpcport={RPC_PORT}")
-        print(f"     - rpcallowip=127.0.0.1 (or 0.0.0.0/0 for all)")
-        print(f"     - rpcbind=127.0.0.1 (or 0.0.0.0 for all)")
-        print(f"  3. If using Docker, ensure the container is running:")
-        print(f"     docker ps | grep bitcoind")
-        print(f"  4. Verify the port is correct (18332 for testnet, 8332 for mainnet)")
-        print(f"  5. Check firewall settings")
+        print("     - rpcallowip=127.0.0.1 (or 0.0.0.0/0 for all)")
+        print("     - rpcbind=127.0.0.1 (or 0.0.0.0 for all)")
+        print("  3. If using Docker, ensure the container is running:")
+        print("     docker ps | grep bitcoind")
+        print("  4. Verify the port is correct (18332 for testnet, 8332 for mainnet)")
+        print("  5. Check firewall settings")
         return False
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 401:
-            print(f"✗ Authentication failed. Check RPC_USER and RPC_PASSWORD.")
-            print(f"  Current settings: user={RPC_USER}, password={'*' * len(RPC_PASSWORD)}")
+            print("✗ Authentication failed. Check RPC_USER and RPC_PASSWORD.")
+            print(
+                f"  Current settings: user={RPC_USER}, password={'*' * len(RPC_PASSWORD)}"
+            )
         else:
             print(f"✗ HTTP error: {e}")
         return False
@@ -80,28 +84,37 @@ def test_rpc_connection():
         print(f"✗ RPC connection test failed: {e}")
         return False
 
+
 def rpc_call(method, params=None):
-    payload = json.dumps({
-        "jsonrpc": "1.0",
-        "id": "quantum-check",
-        "method": method,
-        "params": params or []
-    })
+    payload = json.dumps(
+        {
+            "jsonrpc": "1.0",
+            "id": "quantum-check",
+            "method": method,
+            "params": params or [],
+        }
+    )
     try:
-        resp = requests.post(RPC_URL, auth=(RPC_USER, RPC_PASSWORD),
-                             headers={"content-type": "text/plain"},
-                             data=payload,
-                             timeout=120)
+        resp = requests.post(
+            RPC_URL,
+            auth=(RPC_USER, RPC_PASSWORD),
+            headers={"content-type": "text/plain"},
+            data=payload,
+            timeout=120,
+        )
         resp.raise_for_status()
         r = resp.json()
         if r.get("error"):
             raise Exception(r["error"])
         return r["result"]
     except requests.exceptions.ConnectionError as e:
-        raise ConnectionError(f"Cannot connect to Bitcoin RPC at {RPC_URL}. "
-                            f"Is Bitcoin Core running? Error: {e}")
+        raise ConnectionError(
+            f"Cannot connect to Bitcoin RPC at {RPC_URL}. "
+            f"Is Bitcoin Core running? Error: {e}"
+        )
     except requests.exceptions.Timeout as e:
         raise TimeoutError(f"RPC request to {RPC_URL} timed out. Error: {e}")
+
 
 class RPCBatchError(RuntimeError):
     def __init__(self, message, pending=None, last_error=None):
@@ -132,12 +145,14 @@ def rpc_batch_call(rpc_requests, description="RPC batch request"):
         for idx, (method, params, identifier) in enumerate(pending):
             request_id = f"batch-{method}-{identifier}-{attempts}-{idx}"
             id_to_index[request_id] = idx
-            payload.append({
-                "jsonrpc": "1.0",
-                "id": request_id,
-                "method": method,
-                "params": params or []
-            })
+            payload.append(
+                {
+                    "jsonrpc": "1.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": params or [],
+                }
+            )
 
         try:
             resp = requests.post(
@@ -145,18 +160,24 @@ def rpc_batch_call(rpc_requests, description="RPC batch request"):
                 auth=(RPC_USER, RPC_PASSWORD),
                 headers={"content-type": "text/plain"},
                 data=json.dumps(payload),
-                timeout=120
+                timeout=120,
             )
             resp.raise_for_status()
             response_payload = resp.json()
-        except (requests.exceptions.ConnectionError,
-                requests.exceptions.Timeout,
-                requests.exceptions.HTTPError) as e:
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.HTTPError,
+        ) as e:
             last_error = e
         except Exception as e:
             last_error = e
         else:
-            responses = response_payload if isinstance(response_payload, list) else [response_payload]
+            responses = (
+                response_payload
+                if isinstance(response_payload, list)
+                else [response_payload]
+            )
             for entry in responses:
                 request_id = entry.get("id")
                 if request_id not in id_to_index:
@@ -174,22 +195,27 @@ def rpc_batch_call(rpc_requests, description="RPC batch request"):
             attempts += 1
             if attempts < MAX_RETRIES:
                 pending_identifiers = [req[2] for req in pending]
-                print(f"Retrying {len(pending)} requests for {description} "
-                      f"(attempt {attempts + 1}/{MAX_RETRIES}); pending identifiers: {pending_identifiers}")
+                print(
+                    f"Retrying {len(pending)} requests for {description} "
+                    f"(attempt {attempts + 1}/{MAX_RETRIES}); pending identifiers: {pending_identifiers}"
+                )
                 time.sleep(RECONNECT_DELAY)
 
     if shutdown_requested:
-        raise RPCBatchError(f"{description} interrupted by shutdown request.", last_error="shutdown")
+        raise RPCBatchError(
+            f"{description} interrupted by shutdown request.", last_error="shutdown"
+        )
 
     if pending:
         pending_identifiers = [req[2] for req in pending]
         raise RPCBatchError(
             f"{description} failed after {MAX_RETRIES} retries; pending identifiers: {pending_identifiers}",
             pending=pending_identifiers,
-            last_error=last_error
+            last_error=last_error,
         )
 
     return results
+
 
 # ========================
 # DB
@@ -216,13 +242,23 @@ def update_address_status_with_vout_balance(cur, vout_rows):
             else:
                 # Sum the balance, keep first occurrence's metadata
                 old_sum, script_type, height, block_ts = address_data[address]
-                address_data[address] = (old_sum + value_sat, script_type, height, block_ts)
+                address_data[address] = (
+                    old_sum + value_sat,
+                    script_type,
+                    height,
+                    block_ts,
+                )
 
     # Upsert addresses with all required fields for new addresses
     if address_data:
         rows_to_upsert = [
             (address, script_type, False, height, block_ts, value_sat)
-            for address, (value_sat, script_type, height, block_ts) in address_data.items()
+            for address, (
+                value_sat,
+                script_type,
+                height,
+                block_ts,
+            ) in address_data.items()
         ]
         sql = """
             INSERT INTO address_status (address, script_pub_type, reused, created_block, created_block_timestamp, balance_sat)
@@ -232,7 +268,10 @@ def update_address_status_with_vout_balance(cur, vout_rows):
         """
         execute_values(cur, sql, rows_to_upsert)
 
-def update_address_status_with_vin_balance(cur, deleted_utxos, height=None, block_ts=None):
+
+def update_address_status_with_vin_balance(
+    cur, deleted_utxos, height=None, block_ts=None
+):
     """
     Updates the address_status table to decrement balances and mark as reused for addresses whose UTXOs were spent.
     Seeing an address in a VIN means it's reused, so set reused = TRUE.
@@ -261,14 +300,18 @@ def update_address_status_with_vin_balance(cur, deleted_utxos, height=None, bloc
         rows_to_upsert = []
         for address, (balance_delta, script_type) in address_data.items():
             # For new addresses, use provided height/block_ts or NULL
-            rows_to_upsert.append((
-                address,
-                script_type,
-                True,  # reused = TRUE (address is being spent)
-                height if height is not None else None,  # created_block
-                block_ts if block_ts is not None else None,  # created_block_timestamp
-                balance_delta  # balance_sat (negative value for decrement)
-            ))
+            rows_to_upsert.append(
+                (
+                    address,
+                    script_type,
+                    True,  # reused = TRUE (address is being spent)
+                    height if height is not None else None,  # created_block
+                    block_ts
+                    if block_ts is not None
+                    else None,  # created_block_timestamp
+                    balance_delta,  # balance_sat (negative value for decrement)
+                )
+            )
 
         sql = """
             INSERT INTO address_status (address, script_pub_type, reused, created_block, created_block_timestamp, balance_sat)
@@ -278,6 +321,7 @@ def update_address_status_with_vin_balance(cur, deleted_utxos, height=None, bloc
                     reused = TRUE
         """
         execute_values(cur, sql, rows_to_upsert)
+
 
 def update_address_stats_incremental(cur, vout_rows, deleted_utxos):
     """
@@ -305,7 +349,8 @@ def update_address_stats_incremental(cur, vout_rows, deleted_utxos):
 
     # Recalculate address_stats for affected script types from address_status
     # This ensures accuracy since address_status has been updated with balance changes
-    cur.execute("""
+    cur.execute(
+        """
         INSERT INTO address_stats (
             script_pub_type,
             reused_sat,
@@ -327,7 +372,10 @@ def update_address_stats_incremental(cur, vout_rows, deleted_utxos):
             total_sat = EXCLUDED.total_sat,
             reused_count = EXCLUDED.reused_count,
             count = EXCLUDED.count
-    """, (tuple(affected_script_types),))
+    """,
+        (tuple(affected_script_types),),
+    )
+
 
 def bulk_insert_utxos_copy(cur, utxo_rows):
     """
@@ -352,6 +400,7 @@ def bulk_insert_utxos_copy(cur, utxo_rows):
 
     execute_values(cur, insert_sql, utxo_rows, page_size=DB_PAGE_ROWS)
 
+
 def bulk_insert_block_log_copy(cur, block_rows):
     """Insert block_log entries using execute_values."""
     if not block_rows:
@@ -367,6 +416,7 @@ def bulk_insert_block_log_copy(cur, block_rows):
     """
 
     execute_values(cur, insert_sql, block_rows, page_size=DB_PAGE_ROWS)
+
 
 def bulk_delete_utxos(cur, spend_rows):
     """
@@ -385,9 +435,12 @@ def bulk_delete_utxos(cur, spend_rows):
     # We need to use execute_values pattern but with RETURNING, so we'll do it in batches
     deleted_utxos = []
 
-    for page in [delete_rows[i:i+DB_PAGE_ROWS] for i in range(0, len(delete_rows), DB_PAGE_ROWS)]:
+    for page in [
+        delete_rows[i : i + DB_PAGE_ROWS]
+        for i in range(0, len(delete_rows), DB_PAGE_ROWS)
+    ]:
         # Build the VALUES clause manually for this page
-        placeholders = ','.join(['(%s, %s)'] * len(page))
+        placeholders = ",".join(["(%s, %s)"] * len(page))
         delete_sql = f"""
             DELETE FROM utxos
             WHERE (txid, vout) IN (VALUES {placeholders})
@@ -400,7 +453,13 @@ def bulk_delete_utxos(cur, spend_rows):
 
     return deleted_utxos
 
-def prepare_stats_batch(total_utxo: int, type_counts: Dict[str, int], total_balance_sat: int = 0, type_balances: Dict[str, int] = None) -> List[tuple]:
+
+def prepare_stats_batch(
+    total_utxo: int,
+    type_counts: Dict[str, int],
+    total_balance_sat: int = 0,
+    type_balances: Dict[str, int] = None,
+) -> List[tuple]:
     """
     Prepare stats records for insertion/upsert.
     total_utxo: change in UTXO count (positive for additions, negative for deletions)
@@ -410,15 +469,16 @@ def prepare_stats_batch(total_utxo: int, type_counts: Dict[str, int], total_bala
     """
     stats_batch = []
     if total_utxo:
-        stats_batch.append(('total_utxo', total_utxo))
+        stats_batch.append(("total_utxo", total_utxo))
     if total_balance_sat:
-        stats_batch.append(('total_balance_sat', total_balance_sat))
+        stats_batch.append(("total_balance_sat", total_balance_sat))
     for script_type, count in type_counts.items():
         stats_batch.append((f"{script_type}_count", count))
     if type_balances:
         for script_type, balance in type_balances.items():
             stats_batch.append((f"{script_type}_balance_sat", balance))
     return stats_batch
+
 
 def upsert_stats(cur, stats_batch: List[tuple], *, absolute: bool = False):
     """
@@ -441,6 +501,7 @@ def upsert_stats(cur, stats_batch: List[tuple], *, absolute: bool = False):
         """
 
     execute_values(cur, stats_upsert_sql, stats_batch)
+
 
 def recalculate_stats_from_db(cur):
     """
@@ -498,6 +559,7 @@ def recalculate_stats_from_db(cur):
         AND key NOT IN ('total_utxo', 'total_balance_sat')
     """)
 
+
 def schema_init():
     schema_path = os.path.join(os.path.dirname(__file__), "db", "schema.sql")
     db.init_pool()
@@ -513,7 +575,9 @@ def schema_init():
         table_exists = cur.fetchone()[0]
 
         if table_exists:
-            print("Schema already initialized (block_log table exists), skipping initialization.")
+            print(
+                "Schema already initialized (block_log table exists), skipping initialization."
+            )
             return
 
         # Schema not initialized, run the SQL
@@ -523,10 +587,12 @@ def schema_init():
         cur.execute(schema_sql)
         print("Schema initialization completed.")
 
+
 # ========================
 # Global state for graceful shutdown
 # ========================
 shutdown_requested = False
+
 
 def signal_handler(signum, frame):
     """Handle SIGINT/SIGTERM for graceful shutdown."""
@@ -534,12 +600,16 @@ def signal_handler(signum, frame):
     print(f"\nReceived signal {signum}, shutting down gracefully...")
     shutdown_requested = True
 
+
 # ========================
 # Range processing
 # ========================
 def _extract_block_data(block, height, blockhash):
     """Extract VOUTs and VINs from a block (uses shared block_data with shutdown check)."""
-    return _extract_block_data_core(block, height, blockhash, shutdown_check=lambda: shutdown_requested)
+    return _extract_block_data_core(
+        block, height, blockhash, shutdown_check=lambda: shutdown_requested
+    )
+
 
 def get_last_processed_height():
     try:
@@ -550,6 +620,7 @@ def get_last_processed_height():
     except Exception as e:
         print(f"Error getting last processed height: {e}")
         return 0
+
 
 def process_single_block(height):
     """Process a single block and extract VOUTs (UTXOs) to database."""
@@ -573,14 +644,14 @@ def process_single_block(height):
         print(f"Shutdown requested while processing block {height}")
         return False
 
-    vout_rows = block_data['vout_rows']
-    spend_rows = block_data['spend_rows']
-    block_ts = block_data['block_info']['block_timestamp']
-    stats = block_data['stats']
-    total_utxo = stats['total_utxo']
-    total_balance_sat = stats['total_balance_sat']
-    type_counts = stats['type_counts']
-    type_balances = stats['type_balances']
+    vout_rows = block_data["vout_rows"]
+    spend_rows = block_data["spend_rows"]
+    block_ts = block_data["block_info"]["block_timestamp"]
+    stats = block_data["stats"]
+    total_utxo = stats["total_utxo"]
+    total_balance_sat = stats["total_balance_sat"]
+    type_counts = stats["type_counts"]
+    type_balances = stats["type_balances"]
 
     try:
         db_start = time.time()
@@ -601,7 +672,9 @@ def process_single_block(height):
                 vout_time = time.time() - vout_start
                 if vout_time > 0:
                     rows_per_sec = vout_count / vout_time
-                    print(f"[Block {height}] Inserted {vout_count} UTXOs in {vout_time:.3f}s ({rows_per_sec:.0f} rows/sec)")
+                    print(
+                        f"[Block {height}] Inserted {vout_count} UTXOs in {vout_time:.3f}s ({rows_per_sec:.0f} rows/sec)"
+                    )
 
             # Delete UTXOs that have been spent
             deleted_balance_sat = 0
@@ -615,7 +688,9 @@ def process_single_block(height):
                 print(f"[Block {height}] Deleting {spend_count} spent UTXOs...")
                 deleted_utxos = bulk_delete_utxos(cur, spend_rows)
                 # Update address_status to decrement balances for spent UTXOs
-                update_address_status_with_vin_balance(cur, deleted_utxos, height=height, block_ts=block_ts)
+                update_address_status_with_vin_balance(
+                    cur, deleted_utxos, height=height, block_ts=block_ts
+                )
 
                 # Track balance and counts for deleted UTXOs
                 for address, value_sat, script_type in deleted_utxos:
@@ -625,7 +700,9 @@ def process_single_block(height):
                 spend_time = time.time() - spend_start
                 if spend_time > 0:
                     rows_per_sec = spend_count / spend_time
-                    print(f"[Block {height}] Deleted {spend_count} spent UTXOs in {spend_time:.3f}s ({rows_per_sec:.0f} rows/sec)")
+                    print(
+                        f"[Block {height}] Deleted {spend_count} spent UTXOs in {spend_time:.3f}s ({rows_per_sec:.0f} rows/sec)"
+                    )
 
             # Insert block log entry
             bulk_insert_block_log_copy(cur, [(height, blockhash, block_ts)])
@@ -634,14 +711,27 @@ def process_single_block(height):
             net_total_utxo = total_utxo - sum(deleted_type_counts.values())
             net_total_balance_sat = total_balance_sat - deleted_balance_sat
             all_type_keys = set(type_counts.keys()) | set(deleted_type_counts.keys())
-            net_type_counts = {k: type_counts.get(k, 0) - deleted_type_counts.get(k, 0) for k in all_type_keys}
-            all_balance_keys = set(type_balances.keys()) | set(deleted_type_balances.keys())
-            net_type_balances = {k: type_balances.get(k, 0) - deleted_type_balances.get(k, 0) for k in all_balance_keys}
+            net_type_counts = {
+                k: type_counts.get(k, 0) - deleted_type_counts.get(k, 0)
+                for k in all_type_keys
+            }
+            all_balance_keys = set(type_balances.keys()) | set(
+                deleted_type_balances.keys()
+            )
+            net_type_balances = {
+                k: type_balances.get(k, 0) - deleted_type_balances.get(k, 0)
+                for k in all_balance_keys
+            }
             # Remove zero values
             net_type_counts = {k: v for k, v in net_type_counts.items() if v != 0}
             net_type_balances = {k: v for k, v in net_type_balances.items() if v != 0}
 
-            stats_batch = prepare_stats_batch(net_total_utxo, net_type_counts, net_total_balance_sat, net_type_balances)
+            stats_batch = prepare_stats_batch(
+                net_total_utxo,
+                net_type_counts,
+                net_total_balance_sat,
+                net_type_balances,
+            )
             upsert_stats(cur, stats_batch)
 
             # Update address_stats table for affected script types
@@ -654,6 +744,7 @@ def process_single_block(height):
         print(f"Error writing block {height} to PostgreSQL: {e}")
         return False
 
+
 def process_range_legacy(start_height, end_height, chunk_size=CHUNK_SIZE):
     if start_height > end_height:
         return
@@ -665,11 +756,7 @@ def process_range_legacy(start_height, end_height, chunk_size=CHUNK_SIZE):
         block_data = _extract_block_data(block, height, blockhash)
         if block_data is None:
             print(f"Shutdown requested while preparing chunk data for block {height}")
-            return {
-                'vout_rows': [],
-                'spend_rows': [],
-                'block_info': None
-            }
+            return {"vout_rows": [], "spend_rows": [], "block_info": None}
         return block_data
 
     for chunk_start in range(start_height, end_height + 1, chunk_size):
@@ -680,7 +767,7 @@ def process_range_legacy(start_height, end_height, chunk_size=CHUNK_SIZE):
         chunk_end = min(chunk_start + chunk_size - 1, end_height)
         print(f"Processing chunk {chunk_start} → {chunk_end}")
 
-        out_lists = {'vout_rows': [], 'spend_rows': [], 'scanned': []}
+        out_lists = {"vout_rows": [], "spend_rows": [], "scanned": []}
         chunk_heights = list(range(chunk_start, chunk_end + 1))
         chunk_type_counts: Dict[str, int] = defaultdict(int)
         chunk_type_balances: Dict[str, int] = defaultdict(int)
@@ -693,51 +780,73 @@ def process_range_legacy(start_height, end_height, chunk_size=CHUNK_SIZE):
         fetch_start = time.time()
 
         try:
-            hash_batch_requests = [("getblockhash", [height], height) for height in chunk_heights]
-            hash_results = rpc_batch_call(hash_batch_requests, description=f"getblockhash {chunk_start}-{chunk_end}")
+            hash_batch_requests = [
+                ("getblockhash", [height], height) for height in chunk_heights
+            ]
+            hash_results = rpc_batch_call(
+                hash_batch_requests,
+                description=f"getblockhash {chunk_start}-{chunk_end}",
+            )
 
-            block_batch_requests = [("getblock", [hash_results[height], 3], height) for height in chunk_heights]
-            block_results = rpc_batch_call(block_batch_requests, description=f"getblock {chunk_start}-{chunk_end}")
+            block_batch_requests = [
+                ("getblock", [hash_results[height], 3], height)
+                for height in chunk_heights
+            ]
+            block_results = rpc_batch_call(
+                block_batch_requests, description=f"getblock {chunk_start}-{chunk_end}"
+            )
         except RPCBatchError as e:
-            print(f"Fatal RPC failure while fetching chunk {chunk_start}-{chunk_end}: {e}")
+            print(
+                f"Fatal RPC failure while fetching chunk {chunk_start}-{chunk_end}: {e}"
+            )
             raise
 
         for height in chunk_heights:
             if shutdown_requested:
-                print(f"Shutdown requested while processing chunk {chunk_start}-{chunk_end}, stopping block accumulation")
+                print(
+                    f"Shutdown requested while processing chunk {chunk_start}-{chunk_end}, stopping block accumulation"
+                )
                 break
 
             blockhash = hash_results.get(height)
             block = block_results.get(height)
 
             if blockhash is None or block is None:
-                raise RPCBatchError(f"Missing RPC data for block {height}", pending=[height], last_error="missing data")
+                raise RPCBatchError(
+                    f"Missing RPC data for block {height}",
+                    pending=[height],
+                    last_error="missing data",
+                )
 
             try:
                 block_data = process_block_data(block, height, blockhash)
             except Exception as e:
                 raise RuntimeError(f"Failed to process block {height}: {e}") from e
 
-            out_lists['vout_rows'].extend(block_data['vout_rows'])
-            out_lists['spend_rows'].extend(block_data.get('spend_rows', []))
-            if block_data['block_info']:
-                out_lists['scanned'].append(block_data['block_info'])
-            block_stats = block_data.get('stats', {})
-            chunk_total_utxo += block_stats.get('total_utxo', 0)
-            chunk_total_balance_sat += block_stats.get('total_balance_sat', 0)
-            for script_type, count in block_stats.get('type_counts', {}).items():
+            out_lists["vout_rows"].extend(block_data["vout_rows"])
+            out_lists["spend_rows"].extend(block_data.get("spend_rows", []))
+            if block_data["block_info"]:
+                out_lists["scanned"].append(block_data["block_info"])
+            block_stats = block_data.get("stats", {})
+            chunk_total_utxo += block_stats.get("total_utxo", 0)
+            chunk_total_balance_sat += block_stats.get("total_balance_sat", 0)
+            for script_type, count in block_stats.get("type_counts", {}).items():
                 chunk_type_counts[script_type] += count
-            for script_type, balance in block_stats.get('type_balances', {}).items():
+            for script_type, balance in block_stats.get("type_balances", {}).items():
                 chunk_type_balances[script_type] += balance
 
         if shutdown_requested:
             break
 
         fetch_time = time.time() - fetch_start
-        print(f"[Chunk {chunk_start}-{chunk_end}] Fetched {chunk_end - chunk_start + 1} blocks in {fetch_time:.3f}s")
+        print(
+            f"[Chunk {chunk_start}-{chunk_end}] Fetched {chunk_end - chunk_start + 1} blocks in {fetch_time:.3f}s"
+        )
 
         if shutdown_requested:
-            print(f"Skipping database write for chunk {chunk_start}-{chunk_end} due to shutdown request")
+            print(
+                f"Skipping database write for chunk {chunk_start}-{chunk_end} due to shutdown request"
+            )
             break
 
         try:
@@ -745,38 +854,56 @@ def process_range_legacy(start_height, end_height, chunk_size=CHUNK_SIZE):
             print(f"[Chunk {chunk_start}-{chunk_end}] Starting database write...")
             with db.get_db_cursor() as cur:
                 if shutdown_requested:
-                    print(f"Shutdown requested before writing chunk {chunk_start}-{chunk_end} to database")
+                    print(
+                        f"Shutdown requested before writing chunk {chunk_start}-{chunk_end} to database"
+                    )
                     break
 
-                if out_lists['vout_rows']:
+                if out_lists["vout_rows"]:
                     vout_start = time.time()
-                    vout_count = len(out_lists['vout_rows'])
-                    print(f"[Chunk {chunk_start}-{chunk_end}] Inserting {vout_count} UTXOs ...")
-                    bulk_insert_utxos_copy(cur, out_lists['vout_rows'])
-                    update_address_status_with_vout_balance(cur, out_lists['vout_rows'])
+                    vout_count = len(out_lists["vout_rows"])
+                    print(
+                        f"[Chunk {chunk_start}-{chunk_end}] Inserting {vout_count} UTXOs ..."
+                    )
+                    bulk_insert_utxos_copy(cur, out_lists["vout_rows"])
+                    update_address_status_with_vout_balance(cur, out_lists["vout_rows"])
                     vout_time = time.time() - vout_start
                     if vout_time > 0:
                         rows_per_sec = vout_count / vout_time
-                        print(f"[Chunk {chunk_start}-{chunk_end}] Inserted {vout_count} UTXOs in {vout_time:.3f}s ({rows_per_sec:.0f} rows/sec)")
+                        print(
+                            f"[Chunk {chunk_start}-{chunk_end}] Inserted {vout_count} UTXOs in {vout_time:.3f}s ({rows_per_sec:.0f} rows/sec)"
+                        )
 
                 # Delete UTXOs that have been spent
                 deleted_balance_sat = 0
                 deleted_type_balances: Dict[str, int] = defaultdict(int)
                 deleted_type_counts: Dict[str, int] = defaultdict(int)
 
-                if out_lists['spend_rows']:
+                if out_lists["spend_rows"]:
                     spend_start = time.time()
-                    spend_count = len(out_lists['spend_rows'])
-                    print(f"[Chunk {chunk_start}-{chunk_end}] Deleting {spend_count} spent UTXOs...")
-                    deleted_utxos = bulk_delete_utxos(cur, out_lists['spend_rows'])
+                    spend_count = len(out_lists["spend_rows"])
+                    print(
+                        f"[Chunk {chunk_start}-{chunk_end}] Deleting {spend_count} spent UTXOs..."
+                    )
+                    deleted_utxos = bulk_delete_utxos(cur, out_lists["spend_rows"])
 
                     # Extract max block height and timestamp from spend_rows for new address creation
                     # spend_rows structure: (spent_by_txid, spent_vin, spent_block, spent_block_timestamp, txid, vout)
-                    max_height = max(row[2] for row in out_lists['spend_rows']) if out_lists['spend_rows'] else None
-                    max_block_ts = max(row[3] for row in out_lists['spend_rows']) if out_lists['spend_rows'] else None
+                    max_height = (
+                        max(row[2] for row in out_lists["spend_rows"])
+                        if out_lists["spend_rows"]
+                        else None
+                    )
+                    max_block_ts = (
+                        max(row[3] for row in out_lists["spend_rows"])
+                        if out_lists["spend_rows"]
+                        else None
+                    )
 
                     # Update address_status to decrement balances for spent UTXOs
-                    update_address_status_with_vin_balance(cur, deleted_utxos, height=max_height, block_ts=max_block_ts)
+                    update_address_status_with_vin_balance(
+                        cur, deleted_utxos, height=max_height, block_ts=max_block_ts
+                    )
 
                     # Track balance and counts for deleted UTXOs
                     for address, value_sat, script_type in deleted_utxos:
@@ -786,36 +913,65 @@ def process_range_legacy(start_height, end_height, chunk_size=CHUNK_SIZE):
                     spend_time = time.time() - spend_start
                     if spend_time > 0:
                         rows_per_sec = spend_count / spend_time
-                        print(f"[Chunk {chunk_start}-{chunk_end}] Deleted {spend_count} spent UTXOs in {spend_time:.3f}s ({rows_per_sec:.0f} rows/sec)")
+                        print(
+                            f"[Chunk {chunk_start}-{chunk_end}] Deleted {spend_count} spent UTXOs in {spend_time:.3f}s ({rows_per_sec:.0f} rows/sec)"
+                        )
 
-                if out_lists['scanned']:
+                if out_lists["scanned"]:
                     block_log_start = time.time()
-                    block_count = len(out_lists['scanned'])
-                    block_vals = [(b['block_height'], b['block_hash'], b['block_timestamp']) for b in out_lists['scanned']]
-                    print(f"[Chunk {chunk_start}-{chunk_end}] Inserting {block_count} block_log entries using COPY...")
+                    block_count = len(out_lists["scanned"])
+                    block_vals = [
+                        (b["block_height"], b["block_hash"], b["block_timestamp"])
+                        for b in out_lists["scanned"]
+                    ]
+                    print(
+                        f"[Chunk {chunk_start}-{chunk_end}] Inserting {block_count} block_log entries using COPY..."
+                    )
                     bulk_insert_block_log_copy(cur, block_vals)
                     block_log_time = time.time() - block_log_start
-                    print(f"[Chunk {chunk_start}-{chunk_end}] Inserted {block_count} block_log entries in {block_log_time:.3f}s")
+                    print(
+                        f"[Chunk {chunk_start}-{chunk_end}] Inserted {block_count} block_log entries in {block_log_time:.3f}s"
+                    )
 
                 # Calculate net changes for stats (additions - deletions)
                 net_total_utxo = chunk_total_utxo - sum(deleted_type_counts.values())
                 net_total_balance_sat = chunk_total_balance_sat - deleted_balance_sat
-                all_type_keys = set(chunk_type_counts.keys()) | set(deleted_type_counts.keys())
-                net_type_counts = {k: chunk_type_counts.get(k, 0) - deleted_type_counts.get(k, 0) for k in all_type_keys}
-                all_balance_keys = set(chunk_type_balances.keys()) | set(deleted_type_balances.keys())
-                net_type_balances = {k: chunk_type_balances.get(k, 0) - deleted_type_balances.get(k, 0) for k in all_balance_keys}
+                all_type_keys = set(chunk_type_counts.keys()) | set(
+                    deleted_type_counts.keys()
+                )
+                net_type_counts = {
+                    k: chunk_type_counts.get(k, 0) - deleted_type_counts.get(k, 0)
+                    for k in all_type_keys
+                }
+                all_balance_keys = set(chunk_type_balances.keys()) | set(
+                    deleted_type_balances.keys()
+                )
+                net_type_balances = {
+                    k: chunk_type_balances.get(k, 0) - deleted_type_balances.get(k, 0)
+                    for k in all_balance_keys
+                }
                 # Remove zero values
                 net_type_counts = {k: v for k, v in net_type_counts.items() if v != 0}
-                net_type_balances = {k: v for k, v in net_type_balances.items() if v != 0}
+                net_type_balances = {
+                    k: v for k, v in net_type_balances.items() if v != 0
+                }
 
-                stats_batch = prepare_stats_batch(net_total_utxo, net_type_counts, net_total_balance_sat, net_type_balances)
+                stats_batch = prepare_stats_batch(
+                    net_total_utxo,
+                    net_type_counts,
+                    net_total_balance_sat,
+                    net_type_balances,
+                )
                 upsert_stats(cur, stats_batch)
 
             db_time = time.time() - db_start
-            print(f"[Chunk {chunk_start}-{chunk_end}] Database write completed in {db_time:.3f}s")
+            print(
+                f"[Chunk {chunk_start}-{chunk_end}] Database write completed in {db_time:.3f}s"
+            )
         except Exception as e:
             print(f"Error writing chunk {chunk_start}-{chunk_end} to PostgreSQL: {e}")
         print(f"Saved and flushed chunk {chunk_start}–{chunk_end}")
+
 
 def read_utxo(height: int = 840_000, batch_size: int = 1_000_000):
     batch: List[tuple] = []
@@ -833,16 +989,19 @@ def read_utxo(height: int = 840_000, batch_size: int = 1_000_000):
         cur.execute("ALTER TABLE utxos DROP CONSTRAINT utxos_pkey;")
         cur.connection.commit()
 
-    with open('./data/utxo.csv', 'r') as f:
-        reader = csv.reader(f, delimiter=',')
+    with open("./data/utxo.csv", "r") as f:
+        reader = csv.reader(f, delimiter=",")
         read_start = time.time()
         for line_num, fields in enumerate(reader, start=1):
             if len(fields) != 6:
-                print(f"Warning: Skipping malformed line {line_num} (expected 6 fields, got {len(fields)})", file=sys.stderr)
+                print(
+                    f"Warning: Skipping malformed line {line_num} (expected 6 fields, got {len(fields)})",
+                    file=sys.stderr,
+                )
                 continue
 
             try:
-                outpoint_parts = fields[0].split(':', 1)
+                outpoint_parts = fields[0].split(":", 1)
                 txid = outpoint_parts[0].strip()
                 vout = int(outpoint_parts[1].strip())
 
@@ -853,35 +1012,52 @@ def read_utxo(height: int = 840_000, batch_size: int = 1_000_000):
                 script_type = get_script_type(script_pub_key, address)
                 type_counts[script_type] += 1
 
-                if address == '':
+                if address == "":
                     continue
 
                 row_tuple = (
-                    txid, vout, address, amount, script_pub_key,
-                    script_type, block_height, 0
+                    txid,
+                    vout,
+                    address,
+                    amount,
+                    script_pub_key,
+                    script_type,
+                    block_height,
+                    0,
                 )
 
                 batch.append(row_tuple)
                 total_utxo += 1
 
                 if len(batch) >= batch_size:
-                    print(f"Reading batch of {len(batch)} rows..., Read CSV batch in {time.time() - read_start}s", file=sys.stderr)
+                    print(
+                        f"Reading batch of {len(batch)} rows..., Read CSV batch in {time.time() - read_start}s",
+                        file=sys.stderr,
+                    )
                     if shutdown_requested:
-                        print(f"Shutdown requested, stopping UTXO import", file=sys.stderr)
+                        print(
+                            "Shutdown requested, stopping UTXO import", file=sys.stderr
+                        )
                         break
                     print(f"Inserting batch of {len(batch)} rows...", file=sys.stderr)
                     insert_start = time.time()
                     with db.get_db_cursor() as cur:
-                            execute_values(cur, insert_sql, batch, page_size=1000)
-                            cur.connection.commit()
+                        execute_values(cur, insert_sql, batch, page_size=1000)
+                        cur.connection.commit()
                     insert_time = time.time() - insert_start
                     rows_per_sec = len(batch) / insert_time
-                    print(f"Inserted batch of {len(batch)} rows in {insert_time:.3f}s ({rows_per_sec:.0f} rows/sec). Total rows: {total_utxo}", file=sys.stderr)
+                    print(
+                        f"Inserted batch of {len(batch)} rows in {insert_time:.3f}s ({rows_per_sec:.0f} rows/sec). Total rows: {total_utxo}",
+                        file=sys.stderr,
+                    )
                     batch = []
                     read_start = time.time()
 
             except (ValueError, IndexError) as e:
-                print(f"Warning: Skipping line {line_num} due to parse error: {e}", file=sys.stderr)
+                print(
+                    f"Warning: Skipping line {line_num} due to parse error: {e}",
+                    file=sys.stderr,
+                )
                 continue
 
     stats_batch = prepare_stats_batch(total_utxo, dict(type_counts))
@@ -895,7 +1071,10 @@ def read_utxo(height: int = 840_000, batch_size: int = 1_000_000):
             final_batch_time = time.time() - final_batch_start
             if final_batch_time > 0:
                 rows_per_sec = len(batch) / final_batch_time
-                print(f"Inserted final batch of {len(batch)} rows in {final_batch_time:.3f}s ({rows_per_sec:.0f} rows/sec)", file=sys.stderr)
+                print(
+                    f"Inserted final batch of {len(batch)} rows in {final_batch_time:.3f}s ({rows_per_sec:.0f} rows/sec)",
+                    file=sys.stderr,
+                )
         upsert_stats(cur, stats_batch, absolute=True)
 
         index_start = time.time()
@@ -913,17 +1092,26 @@ def read_utxo(height: int = 840_000, batch_size: int = 1_000_000):
             END $$;
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS utxos_address_idx ON utxos (address);")
-        cur.execute("INSERT INTO block_log (block_height, block_hash, block_timestamp) VALUES (%s, %s, 0) ON CONFLICT DO NOTHING;", (height, '0' * 64))
+        cur.execute(
+            "INSERT INTO block_log (block_height, block_hash, block_timestamp) VALUES (%s, %s, 0) ON CONFLICT DO NOTHING;",
+            (height, "0" * 64),
+        )
         index_time = time.time() - index_start
-        print(f"Created indexes and updated block_log in {index_time:.3f}s", file=sys.stderr)
+        print(
+            f"Created indexes and updated block_log in {index_time:.3f}s",
+            file=sys.stderr,
+        )
 
         cur.connection.commit()
 
     final_insert_time = time.time() - final_insert_start
-    print(f"Final batch insertion complete in {final_insert_time:.3f}s. ", file=sys.stderr)
+    print(
+        f"Final batch insertion complete in {final_insert_time:.3f}s. ", file=sys.stderr
+    )
     print(f"UTXO import complete. Total rows inserted: {total_utxo}", file=sys.stderr)
 
     return
+
 
 def main():
     global shutdown_requested
@@ -945,7 +1133,9 @@ def main():
     # Test RPC connection before proceeding
     print("\nTesting Bitcoin RPC connection...")
     if not test_rpc_connection():
-        print("\nFatal: Cannot connect to Bitcoin RPC. Please fix the connection and try again.")
+        print(
+            "\nFatal: Cannot connect to Bitcoin RPC. Please fix the connection and try again."
+        )
         db.shutdown_pool()
         sys.exit(1)
 
@@ -975,16 +1165,18 @@ def main():
         # Run chunked catch-up when 100+ blocks to process, or when STOP_AT_HEIGHT is set (process up to end)
         if start <= end and (start + epsilon <= end or STOP_AT_HEIGHT is not None):
             if STOP_AT_HEIGHT is not None and end < tip:
-                print(f"Catching up: processing blocks {start} → {end} (STOP_AT_HEIGHT={STOP_AT_HEIGHT}, chain tip {tip})")
+                print(
+                    f"Catching up: processing blocks {start} → {end} (STOP_AT_HEIGHT={STOP_AT_HEIGHT}, chain tip {tip})"
+                )
             else:
                 print(f"Catching up: processing blocks {start} → {tip}")
-            
+
             # Choose block reader based on configuration
             from .block_reader import RPCBlockReader, BLKFileReader
             from .range_processor import process_range
-            
+
             BLOCK_SOURCE = config.BLOCK_SOURCE
-            if BLOCK_SOURCE == 'blk':
+            if BLOCK_SOURCE == "blk":
                 blocks_dir = config.BLOCKS_DIR
                 # BLOCK_INDEX_DIR: use a copy of blocks/index when Core is running (it holds the lock)
                 block_reader = BLKFileReader(
@@ -992,23 +1184,29 @@ def main():
                     index_path=config.BLOCK_INDEX_DIR,
                     rpc_call=rpc_call,
                     rpc_batch_call=rpc_batch_call,
-                    shutdown_check=lambda: shutdown_requested
+                    shutdown_check=lambda: shutdown_requested,
                 )
                 print("Using BLK file reader for block fetching")
             else:
                 # Use RPC reader (default)
                 block_reader = RPCBlockReader(
-                    rpc_batch_call=rpc_batch_call,
-                    rpc_call=rpc_call
+                    rpc_batch_call=rpc_batch_call, rpc_call=rpc_call
                 )
                 print("Using RPC reader for block fetching")
-            
+
             # Process range with selected block reader (BLK: 1000-block chunks, RPC: CHUNK_SIZE)
-            chunk_size = config.BLK_CHUNK_SIZE if BLOCK_SOURCE == 'blk' else CHUNK_SIZE
-            process_range(start, end, block_reader, chunk_size=chunk_size, shutdown_check=lambda: shutdown_requested)
+            chunk_size = config.BLK_CHUNK_SIZE if BLOCK_SOURCE == "blk" else CHUNK_SIZE
+            process_range(
+                start,
+                end,
+                block_reader,
+                chunk_size=chunk_size,
+                shutdown_check=lambda: shutdown_requested,
+            )
 
             if not shutdown_requested:
                 from .address import calculate_address_stats
+
                 print("Refreshing address_stats after catch-up...")
                 calculate_address_stats()
 
@@ -1027,7 +1225,9 @@ def main():
 
         # Recreate address index if missing
         with db.get_db_cursor() as cur:
-            cur.execute("CREATE INDEX IF NOT EXISTS utxos_address_idx ON utxos (address);")
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS utxos_address_idx ON utxos (address);"
+            )
             # Check if primary key exists before adding it
             cur.execute("""
                 DO $$
@@ -1061,16 +1261,22 @@ def main():
                                 break
                             retries += 1
                             if retries < MAX_RETRIES:
-                                print(f"Retrying block {height} (attempt {retries + 1}/{MAX_RETRIES})...")
+                                print(
+                                    f"Retrying block {height} (attempt {retries + 1}/{MAX_RETRIES})..."
+                                )
                                 time.sleep(1)
                             else:
-                                print(f"Failed to process block {height} after {MAX_RETRIES} retries")
+                                print(
+                                    f"Failed to process block {height} after {MAX_RETRIES} retries"
+                                )
 
                 # Wait before next poll
                 time.sleep(POLL_INTERVAL)
 
             except requests.exceptions.RequestException as e:
-                print(f"RPC connection error: {e}. Retrying in {RECONNECT_DELAY} seconds...")
+                print(
+                    f"RPC connection error: {e}. Retrying in {RECONNECT_DELAY} seconds..."
+                )
                 time.sleep(RECONNECT_DELAY)
             except Exception as e:
                 print(f"Unexpected error in polling loop: {e}")
@@ -1085,6 +1291,7 @@ def main():
         print(f"Fatal error: {e}")
         db.shutdown_pool()
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

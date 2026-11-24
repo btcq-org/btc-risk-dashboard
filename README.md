@@ -71,3 +71,21 @@ python3 -m venv .venv
 ```
 
 Run the indexer with `.venv/bin/python` so `plyvel` is used and you see direct seeks instead of “height N not in blk….dat, trying next file”.
+
+### Tests and lint
+
+CI (`.github/workflows/ci.yml`) runs these on every pull request and every push to `main`:
+
+```bash
+pip install -r requirements.txt ruff==0.17.6
+ruff check .
+ruff format --check .
+python -m compileall -q indexer scripts
+pytest                      # unit tests only; no bitcoind or Postgres needed
+```
+
+Tests that need a live bitcoind or blk*.dat files are marked `integration` and skipped by default. Run them with:
+
+```bash
+BLOCKS_DIR=/path/to/blocks pytest -m integration
+```

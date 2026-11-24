@@ -3,6 +3,7 @@
 Block reader abstraction for fetching Bitcoin blocks from different sources.
 Supports both RPC and BLK file reading methods.
 """
+
 import os
 import sys
 import glob
@@ -14,19 +15,36 @@ from io import BytesIO
 # Import BLK file reading functions from test_blk.py
 try:
     from .test_blk import (
-        read_block, read_blk_file, read_xor_key_from_file, find_bitcoin_folder,
-        read_varint, apply_xor, ShutdownRequested
+        read_block,
+        read_blk_file,
+        read_xor_key_from_file,
+        find_bitcoin_folder,
+        ShutdownRequested,
     )
-    from .core_block_index import get_block_location, get_block_location_from_db, blk_path_from_file_number, BLOCK_FILE_HEADER_SIZE
+    from .core_block_index import (
+        get_block_location,
+        get_block_location_from_db,
+        blk_path_from_file_number,
+        BLOCK_FILE_HEADER_SIZE,
+    )
 except ImportError:
     # Fallback for direct execution
     import sys
+
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from indexer.test_blk import (
-        read_block, read_blk_file, read_xor_key_from_file, find_bitcoin_folder,
-        read_varint, apply_xor, ShutdownRequested
+        read_block,
+        read_blk_file,
+        read_xor_key_from_file,
+        find_bitcoin_folder,
+        ShutdownRequested,
     )
-    from indexer.core_block_index import get_block_location, get_block_location_from_db, blk_path_from_file_number, BLOCK_FILE_HEADER_SIZE
+    from indexer.core_block_index import (
+        get_block_location,
+        get_block_location_from_db,
+        blk_path_from_file_number,
+        BLOCK_FILE_HEADER_SIZE,
+    )
 
 
 class BlockReader(Protocol):
@@ -34,17 +52,18 @@ class BlockReader(Protocol):
     Protocol defining the interface for block readers.
     All block readers must implement fetch_blocks method.
     """
+
     def fetch_blocks(self, heights: List[int]) -> Dict[int, Dict[str, Any]]:
         """
         Fetch blocks for the given heights.
-        
+
         Args:
             heights: List of block heights to fetch
-        
+
         Returns:
             Dictionary mapping height -> block dict (in RPC format)
             Block dict should have: 'tx', 'time', and other RPC getblock fields
-        
+
         Raises:
             Exception: If blocks cannot be fetched
         """
@@ -56,38 +75,38 @@ class RPCBlockReader:
     Block reader that fetches blocks via Bitcoin Core RPC.
     Uses existing RPC infrastructure from main.py
     """
-    
+
     def __init__(self, rpc_batch_call, rpc_call=None):
         """
         Initialize RPC block reader.
-        
+
         Args:
             rpc_batch_call: Function for batch RPC calls (from main.py)
             rpc_call: Optional function for single RPC calls (for getblockcount, etc.)
         """
         self.rpc_batch_call = rpc_batch_call
         self.rpc_call = rpc_call
-    
+
     def fetch_blocks(self, heights: List[int]) -> Dict[int, Dict[str, Any]]:
         """
         Fetch blocks via RPC batch calls.
-        
+
         Args:
             heights: List of block heights to fetch
-        
+
         Returns:
             Dictionary mapping height -> block dict (RPC format)
         """
         if not heights:
             return {}
-        
+
         # First, get block hashes for all heights
         hash_batch_requests = [("getblockhash", [height], height) for height in heights]
         hash_results = self.rpc_batch_call(
             hash_batch_requests,
-            description=f"getblockhash batch for {len(heights)} blocks"
+            description=f"getblockhash batch for {len(heights)} blocks",
         )
-        
+
         # Then, get blocks using the hashes
         block_batch_requests = [
             ("getblock", [hash_results[height], 3], height)
@@ -96,9 +115,9 @@ class RPCBlockReader:
         ]
         block_results = self.rpc_batch_call(
             block_batch_requests,
-            description=f"getblock batch for {len(heights)} blocks"
+            description=f"getblock batch for {len(heights)} blocks",
         )
-        
+
         # Return results with block hashes included
         result = {}
         for height in heights:
@@ -107,22 +126,22 @@ class RPCBlockReader:
                 blockhash = hash_results.get(height, "")
                 # Store blockhash in the block dict for consistency
                 if block:
-                    block['_blockhash'] = blockhash
+                    block["_blockhash"] = blockhash
                 result[height] = block
-        
+
         return result
 
 
 def calculate_txid(tx_raw: bytes) -> str:
     """
     Calculate transaction ID (txid) from raw transaction bytes.
-    txid is double SHA256 of the transaction (for non-SegWit) or 
+    txid is double SHA256 of the transaction (for non-SegWit) or
     single SHA256 for SegWit transactions (wtxid).
     For our purposes, we use double SHA256 which matches RPC format.
-    
+
     Args:
         tx_raw: Raw transaction bytes
-    
+
     Returns:
         Transaction ID as hex string (reversed, as Bitcoin displays it)
     """
@@ -137,16 +156,16 @@ def calculate_block_hash(header_bytes: bytes) -> str:
     """
     Calculate block hash from block header bytes.
     Block hash is double SHA256 of the 80-byte header.
-    
+
     Args:
         header_bytes: 80-byte block header
-    
+
     Returns:
         Block hash as hex string (reversed, as Bitcoin displays it)
     """
     if len(header_bytes) != 80:
         raise ValueError(f"Block header must be 80 bytes, got {len(header_bytes)}")
-    
+
     # Double SHA256
     first_hash = hashlib.sha256(header_bytes).digest()
     second_hash = hashlib.sha256(first_hash).digest()
@@ -159,217 +178,215 @@ def serialize_tx_for_txid(tx: Dict[str, Any]) -> bytes:
     Serialize a transaction from BLK format to calculate txid.
     This reconstructs the transaction in the format used for txid calculation.
     Note: For SegWit transactions, we need to exclude witness data for txid.
-    
+
     Args:
         tx: Transaction dict from BLK format
-    
+
     Returns:
         Serialized transaction bytes (without witness for txid calculation)
     """
     tx_bytes = BytesIO()
-    
+
     # Version (4 bytes, little-endian)
-    tx_bytes.write(struct.pack('<I', tx.get('version', 1)))
-    
+    tx_bytes.write(struct.pack("<I", tx.get("version", 1)))
+
     # For txid, SegWit transactions exclude witness data
     # So we don't write the witness marker here
-    
+
     # Input count (varint)
-    input_count = tx.get('input_count', len(tx.get('inputs', [])))
-    if input_count < 0xfd:
+    input_count = tx.get("input_count", len(tx.get("inputs", [])))
+    if input_count < 0xFD:
         tx_bytes.write(bytes([input_count]))
-    elif input_count <= 0xffff:
-        tx_bytes.write(bytes([0xfd]))
-        tx_bytes.write(struct.pack('<H', input_count))
-    elif input_count <= 0xffffffff:
-        tx_bytes.write(bytes([0xfe]))
-        tx_bytes.write(struct.pack('<I', input_count))
+    elif input_count <= 0xFFFF:
+        tx_bytes.write(bytes([0xFD]))
+        tx_bytes.write(struct.pack("<H", input_count))
+    elif input_count <= 0xFFFFFFFF:
+        tx_bytes.write(bytes([0xFE]))
+        tx_bytes.write(struct.pack("<I", input_count))
     else:
-        tx_bytes.write(bytes([0xff]))
-        tx_bytes.write(struct.pack('<Q', input_count))
-    
+        tx_bytes.write(bytes([0xFF]))
+        tx_bytes.write(struct.pack("<Q", input_count))
+
     # Inputs
-    for inp in tx.get('inputs', []):
+    for inp in tx.get("inputs", []):
         # Previous output hash (32 bytes, in internal byte order for serialization)
-        prev_tx_hash_bytes = bytes.fromhex(inp.get('prev_tx_hash', '0' * 64))[::-1]
+        prev_tx_hash_bytes = bytes.fromhex(inp.get("prev_tx_hash", "0" * 64))[::-1]
         tx_bytes.write(prev_tx_hash_bytes)
         # Previous output index (4 bytes, little-endian)
-        tx_bytes.write(struct.pack('<I', inp.get('prev_output_index', 0)))
+        tx_bytes.write(struct.pack("<I", inp.get("prev_output_index", 0)))
         # Script length (varint) and script (scriptSig) - required for correct txid
-        script_hex = inp.get('script_hex', '')
-        script_bytes = bytes.fromhex(script_hex) if script_hex else b''
+        script_hex = inp.get("script_hex", "")
+        script_bytes = bytes.fromhex(script_hex) if script_hex else b""
         script_len = len(script_bytes)
-        if script_len < 0xfd:
+        if script_len < 0xFD:
             tx_bytes.write(bytes([script_len]))
-        elif script_len <= 0xffff:
-            tx_bytes.write(bytes([0xfd]))
-            tx_bytes.write(struct.pack('<H', script_len))
-        elif script_len <= 0xffffffff:
-            tx_bytes.write(bytes([0xfe]))
-            tx_bytes.write(struct.pack('<I', script_len))
+        elif script_len <= 0xFFFF:
+            tx_bytes.write(bytes([0xFD]))
+            tx_bytes.write(struct.pack("<H", script_len))
+        elif script_len <= 0xFFFFFFFF:
+            tx_bytes.write(bytes([0xFE]))
+            tx_bytes.write(struct.pack("<I", script_len))
         else:
-            tx_bytes.write(bytes([0xff]))
-            tx_bytes.write(struct.pack('<Q', script_len))
+            tx_bytes.write(bytes([0xFF]))
+            tx_bytes.write(struct.pack("<Q", script_len))
         tx_bytes.write(script_bytes)
         # Sequence (4 bytes)
-        tx_bytes.write(struct.pack('<I', inp.get('sequence', 0)))
-    
+        tx_bytes.write(struct.pack("<I", inp.get("sequence", 0)))
+
     # Output count (varint)
-    output_count = tx.get('output_count', len(tx.get('outputs', [])))
-    if output_count < 0xfd:
+    output_count = tx.get("output_count", len(tx.get("outputs", [])))
+    if output_count < 0xFD:
         tx_bytes.write(bytes([output_count]))
-    elif output_count <= 0xffff:
-        tx_bytes.write(bytes([0xfd]))
-        tx_bytes.write(struct.pack('<H', output_count))
-    elif output_count <= 0xffffffff:
-        tx_bytes.write(bytes([0xfe]))
-        tx_bytes.write(struct.pack('<I', output_count))
+    elif output_count <= 0xFFFF:
+        tx_bytes.write(bytes([0xFD]))
+        tx_bytes.write(struct.pack("<H", output_count))
+    elif output_count <= 0xFFFFFFFF:
+        tx_bytes.write(bytes([0xFE]))
+        tx_bytes.write(struct.pack("<I", output_count))
     else:
-        tx_bytes.write(bytes([0xff]))
-        tx_bytes.write(struct.pack('<Q', output_count))
-    
+        tx_bytes.write(bytes([0xFF]))
+        tx_bytes.write(struct.pack("<Q", output_count))
+
     # Outputs
-    for out in tx.get('outputs', []):
+    for out in tx.get("outputs", []):
         # Value (8 bytes, little-endian)
-        tx_bytes.write(struct.pack('<Q', out.get('value', 0)))
+        tx_bytes.write(struct.pack("<Q", out.get("value", 0)))
         # Script length (varint)
-        script_hex = out.get('script_hex', '')
-        script_bytes = bytes.fromhex(script_hex) if script_hex else b''
+        script_hex = out.get("script_hex", "")
+        script_bytes = bytes.fromhex(script_hex) if script_hex else b""
         script_len = len(script_bytes)
-        if script_len < 0xfd:
+        if script_len < 0xFD:
             tx_bytes.write(bytes([script_len]))
-        elif script_len <= 0xffff:
-            tx_bytes.write(bytes([0xfd]))
-            tx_bytes.write(struct.pack('<H', script_len))
-        elif script_len <= 0xffffffff:
-            tx_bytes.write(bytes([0xfe]))
-            tx_bytes.write(struct.pack('<I', script_len))
+        elif script_len <= 0xFFFF:
+            tx_bytes.write(bytes([0xFD]))
+            tx_bytes.write(struct.pack("<H", script_len))
+        elif script_len <= 0xFFFFFFFF:
+            tx_bytes.write(bytes([0xFE]))
+            tx_bytes.write(struct.pack("<I", script_len))
         else:
-            tx_bytes.write(bytes([0xff]))
-            tx_bytes.write(struct.pack('<Q', script_len))
+            tx_bytes.write(bytes([0xFF]))
+            tx_bytes.write(struct.pack("<Q", script_len))
         tx_bytes.write(script_bytes)
-    
+
     # Locktime (4 bytes, little-endian)
-    tx_bytes.write(struct.pack('<I', tx.get('locktime', 0)))
-    
+    tx_bytes.write(struct.pack("<I", tx.get("locktime", 0)))
+
     return tx_bytes.getvalue()
 
 
 def convert_blk_to_rpc_format(blk_block: Dict[str, Any], height: int) -> Dict[str, Any]:
     """
     Convert BLK file block format to RPC format compatible with _extract_block_data.
-    
+
     Args:
         blk_block: Block dict from read_block() in test_blk.py format
         height: Block height
-    
+
     Returns:
         Block dict in RPC format (compatible with getblock RPC response)
     """
-    header = blk_block.get('header', {})
-    timestamp = header.get('timestamp', 0)
-    
+    header = blk_block.get("header", {})
+    timestamp = header.get("timestamp", 0)
+
     # Calculate block hash from header
-    version = header.get('version', 0)
-    prev_block_hash = bytes.fromhex(header.get('prev_block_hash', '0' * 64))[::-1]
-    merkle_root = bytes.fromhex(header.get('merkle_root', '0' * 64))[::-1]
-    timestamp_int = header.get('timestamp', 0)
-    bits = header.get('bits', 0)
-    nonce = header.get('nonce', 0)
-    
+    version = header.get("version", 0)
+    prev_block_hash = bytes.fromhex(header.get("prev_block_hash", "0" * 64))[::-1]
+    merkle_root = bytes.fromhex(header.get("merkle_root", "0" * 64))[::-1]
+    timestamp_int = header.get("timestamp", 0)
+    bits = header.get("bits", 0)
+    nonce = header.get("nonce", 0)
+
     header_bytes = (
-        struct.pack('<I', version) +
-        prev_block_hash +
-        merkle_root +
-        struct.pack('<I', timestamp_int) +
-        struct.pack('<I', bits) +
-        struct.pack('<I', nonce)
+        struct.pack("<I", version)
+        + prev_block_hash
+        + merkle_root
+        + struct.pack("<I", timestamp_int)
+        + struct.pack("<I", bits)
+        + struct.pack("<I", nonce)
     )
     blockhash = calculate_block_hash(header_bytes)
-    
+
     # Convert transactions
     rpc_txs = []
-    for tx in blk_block.get('transactions', []):
+    for tx in blk_block.get("transactions", []):
         # Calculate txid from serialized transaction
         tx_raw = serialize_tx_for_txid(tx)
         txid = calculate_txid(tx_raw)
-        
+
         # Convert inputs to RPC format
         rpc_vins = []
-        for inp in tx.get('inputs', []):
+        for inp in tx.get("inputs", []):
             # Check if this is a coinbase transaction (first input with special format)
             # In BLK format, coinbase has prev_tx_hash of all zeros
-            prev_tx_hash = inp.get('prev_tx_hash', '')
-            is_coinbase = (prev_tx_hash == '0' * 64 or prev_tx_hash == '')
-            
+            prev_tx_hash = inp.get("prev_tx_hash", "")
+            is_coinbase = prev_tx_hash == "0" * 64 or prev_tx_hash == ""
+
             if is_coinbase:
                 vin = {
-                    'coinbase': inp.get('script_hex', ''),
-                    'sequence': inp.get('sequence', 0)
+                    "coinbase": inp.get("script_hex", ""),
+                    "sequence": inp.get("sequence", 0),
                 }
             else:
                 vin = {
-                    'txid': prev_tx_hash,
-                    'vout': inp.get('prev_output_index', 0),
-                    'scriptSig': {
-                        'hex': inp.get('script_hex', '')
-                    },
-                    'sequence': inp.get('sequence', 0)
+                    "txid": prev_tx_hash,
+                    "vout": inp.get("prev_output_index", 0),
+                    "scriptSig": {"hex": inp.get("script_hex", "")},
+                    "sequence": inp.get("sequence", 0),
                 }
-            if 'witness' in inp:
-                vin['txinwitness'] = inp['witness']
+            if "witness" in inp:
+                vin["txinwitness"] = inp["witness"]
             rpc_vins.append(vin)
-        
+
         # Convert outputs to RPC format
         rpc_vouts = []
-        for out in tx.get('outputs', []):
-            value_btc = out.get('value', 0) / 100_000_000  # Convert satoshis to BTC
+        for out in tx.get("outputs", []):
+            value_btc = out.get("value", 0) / 100_000_000  # Convert satoshis to BTC
             vout = {
-                'value': value_btc,
-                'n': len(rpc_vouts),
-                'scriptPubKey': {
-                    'hex': out.get('script_hex', ''),
-                    'type': out.get('script_type', 'unknown')
-                }
+                "value": value_btc,
+                "n": len(rpc_vouts),
+                "scriptPubKey": {
+                    "hex": out.get("script_hex", ""),
+                    "type": out.get("script_type", "unknown"),
+                },
             }
             # Add address if available
-            if out.get('address'):
-                vout['scriptPubKey']['address'] = out.get('address')
-                vout['scriptPubKey']['addresses'] = [out.get('address')]
+            if out.get("address"):
+                vout["scriptPubKey"]["address"] = out.get("address")
+                vout["scriptPubKey"]["addresses"] = [out.get("address")]
             else:
-                vout['scriptPubKey']['addresses'] = []
+                vout["scriptPubKey"]["addresses"] = []
             rpc_vouts.append(vout)
-        
+
         # Create RPC transaction format
         rpc_tx = {
-            'txid': txid,
-            'version': tx.get('version', 1),
-            'vin': rpc_vins,
-            'vout': rpc_vouts,
-            'locktime': tx.get('locktime', 0)
+            "txid": txid,
+            "version": tx.get("version", 1),
+            "vin": rpc_vins,
+            "vout": rpc_vouts,
+            "locktime": tx.get("locktime", 0),
         }
-        
+
         rpc_txs.append(rpc_tx)
-    
+
     # Create RPC block format
     rpc_block = {
-        'hash': blockhash,
-        'height': height,
-        'version': version,
-        'versionHex': f"{version:08x}",
-        'merkleroot': header.get('merkle_root', ''),
-        'time': timestamp,
-        'mediantime': timestamp,
-        'nonce': nonce,
-        'bits': hex(bits),
-        'difficulty': 0,  # Would need to calculate
-        'chainwork': '',  # Would need to calculate
-        'nTx': len(rpc_txs),
-        'previousblockhash': header.get('prev_block_hash', ''),
-        'nextblockhash': '',  # Not available
-        'tx': rpc_txs
+        "hash": blockhash,
+        "height": height,
+        "version": version,
+        "versionHex": f"{version:08x}",
+        "merkleroot": header.get("merkle_root", ""),
+        "time": timestamp,
+        "mediantime": timestamp,
+        "nonce": nonce,
+        "bits": hex(bits),
+        "difficulty": 0,  # Would need to calculate
+        "chainwork": "",  # Would need to calculate
+        "nTx": len(rpc_txs),
+        "previousblockhash": header.get("prev_block_hash", ""),
+        "nextblockhash": "",  # Not available
+        "tx": rpc_txs,
     }
-    
+
     return rpc_block
 
 
@@ -379,11 +396,18 @@ class BLKFileReader:
     Uses a hybrid approach: gets block hashes via RPC (minimal), then finds
     blocks in BLK files by matching block hash.
     """
-    
-    def __init__(self, blocks_dir: Optional[str] = None, index_path: Optional[str] = None, rpc_call=None, rpc_batch_call=None, shutdown_check=None):
+
+    def __init__(
+        self,
+        blocks_dir: Optional[str] = None,
+        index_path: Optional[str] = None,
+        rpc_call=None,
+        rpc_batch_call=None,
+        shutdown_check=None,
+    ):
         """
         Initialize BLK file reader.
-        
+
         Args:
             blocks_dir: Path to Bitcoin blocks directory. If None, auto-detects.
             index_path: Optional path to block index (LevelDB). If None, uses blocks_dir/index.
@@ -396,20 +420,20 @@ class BLKFileReader:
             self.blocks_dir = blocks_dir
         else:
             self.blocks_dir = find_bitcoin_folder()
-        
+
         if not os.path.isdir(self.blocks_dir):
             raise ValueError(f"Blocks directory not found: {self.blocks_dir}")
-        
+
         # Read XOR key if available
         self.xor_key = read_xor_key_from_file(self.blocks_dir)
         if self.xor_key:
-            print(f"BLK Reader: Loaded XOR key from xor.dat")
-        
+            print("BLK Reader: Loaded XOR key from xor.dat")
+
         # RPC functions for getting block hashes (minimal RPC usage)
         self.rpc_call = rpc_call
         self.rpc_batch_call = rpc_batch_call
         self.shutdown_check = shutdown_check
-        
+
         # Cache of blk files (will be populated on first use)
         self._blk_files = None
         # Cache: block_hash -> (file_path, block_index_in_file)
@@ -420,70 +444,104 @@ class BLKFileReader:
             raw_index = os.path.expanduser(raw_index.strip())
             if not os.path.isdir(raw_index):
                 raw_index = None
-        self._index_path = (os.path.abspath(raw_index) if raw_index else None) or os.path.join(self.blocks_dir, "index")
+        self._index_path = (
+            os.path.abspath(raw_index) if raw_index else None
+        ) or os.path.join(self.blocks_dir, "index")
         self._index_db = None  # keep open for lookups when index works
         self._block_index_works = self._check_block_index_at_startup()
-    
+
     def _check_block_index_at_startup(self) -> bool:
         """Try to use Core's block index; keep DB open for lookups if available. Returns True if usable."""
         print("BLK Reader: Python", sys.executable)
         try:
             import plyvel
+
             print("BLK Reader: plyvel OK")
         except ImportError:
-            print("BLK Reader: plyvel not installed in this Python — will scan blk files. Run with same Python that has plyvel (e.g. .venv/bin/python -m indexer.main)")
+            print(
+                "BLK Reader: plyvel not installed in this Python — will scan blk files. Run with same Python that has plyvel (e.g. .venv/bin/python -m indexer.main)"
+            )
             return False
         if not os.path.isdir(self._index_path):
-            print("BLK Reader: No block index at", self._index_path, "— will scan blk files")
+            print(
+                "BLK Reader: No block index at",
+                self._index_path,
+                "— will scan blk files",
+            )
             return False
         genesis_hex = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
         try:
             db = plyvel.DB(self._index_path, create_if_missing=False)
-            key = b'b' + bytes.fromhex(genesis_hex)[::-1]
+            key = b"b" + bytes.fromhex(genesis_hex)[::-1]
             value = db.get(key)
             if value and len(value) >= 80:
-                self._index_db = db  # keep open for all lookups (avoids reopen/lock when Core runs)
-                print("BLK Reader: Using Core block index for direct seeks (index:", self._index_path + ")")
+                self._index_db = (
+                    db  # keep open for all lookups (avoids reopen/lock when Core runs)
+                )
+                print(
+                    "BLK Reader: Using Core block index for direct seeks (index:",
+                    self._index_path + ")",
+                )
                 return True
             db.close()
-            print("BLK Reader: block index open but genesis lookup failed — will scan blk files")
+            print(
+                "BLK Reader: block index open but genesis lookup failed — will scan blk files"
+            )
             return False
         except Exception as e:
             err = str(e).strip()
-            if "LOCK" in err or "lock" in err.lower() or "Resource temporarily unavailable" in err:
-                print("BLK Reader: block index locked by Bitcoin Core — will scan blk files.")
-                print("  To use direct seeks while Core runs: set BLOCK_INDEX_DIR to a copy of the index:")
-                print("    cp -r", self._index_path, "/path/to/index-copy   # while Core is stopped")
+            if (
+                "LOCK" in err
+                or "lock" in err.lower()
+                or "Resource temporarily unavailable" in err
+            ):
+                print(
+                    "BLK Reader: block index locked by Bitcoin Core — will scan blk files."
+                )
+                print(
+                    "  To use direct seeks while Core runs: set BLOCK_INDEX_DIR to a copy of the index:"
+                )
+                print(
+                    "    cp -r",
+                    self._index_path,
+                    "/path/to/index-copy   # while Core is stopped",
+                )
                 print("    export BLOCK_INDEX_DIR=/path/to/index-copy")
             else:
                 print("BLK Reader: block index unavailable — will scan blk files:", e)
             return False
 
-    def _read_block_at_offset(self, file_path: str, n_data_pos: int) -> Optional[Dict[str, Any]]:
+    def _read_block_at_offset(
+        self, file_path: str, n_data_pos: int
+    ) -> Optional[Dict[str, Any]]:
         """Read a single block. n_data_pos is the file offset of the block payload (Core index);
         magic+size are 8 bytes before that."""
         try:
-            with open(file_path, 'rb') as f:
+            with open(file_path, "rb") as f:
                 f.seek(n_data_pos - BLOCK_FILE_HEADER_SIZE)
                 return read_block(f, self.xor_key, self.shutdown_check)
         except Exception:
             return None
-    
+
     def _get_blk_files(self) -> List[str]:
         """Get sorted list of blk*.dat files."""
         if self._blk_files is None:
-            self._blk_files = sorted(glob.glob(os.path.join(self.blocks_dir, "blk*.dat")))
+            self._blk_files = sorted(
+                glob.glob(os.path.join(self.blocks_dir, "blk*.dat"))
+            )
         return self._blk_files
-    
-    def _find_block_by_hash(self, target_hash: str, target_height: Optional[int] = None) -> Optional[Dict[str, Any]]:
+
+    def _find_block_by_hash(
+        self, target_hash: str, target_height: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
         """
         Find a block in BLK files by matching block hash.
         Uses Core's block index (LevelDB) when available for direct seek; else scans files.
-        
+
         Args:
             target_hash: Block hash to find (hex string, normal order)
             target_height: Block height we're searching for (for logging)
-        
+
         Returns:
             Block dict in BLK format, or None if not found
         """
@@ -501,24 +559,31 @@ class BLKFileReader:
                 blk_block = self._read_block_at_offset(blk_path, n_data_pos)
                 if blk_block is not None:
                     # Verify hash matches
-                    header = blk_block.get('header', {})
-                    version = header.get('version', 0)
-                    prev_block_hash = bytes.fromhex(header.get('prev_block_hash', '0' * 64))[::-1]
-                    merkle_root = bytes.fromhex(header.get('merkle_root', '0' * 64))[::-1]
+                    header = blk_block.get("header", {})
+                    version = header.get("version", 0)
+                    prev_block_hash = bytes.fromhex(
+                        header.get("prev_block_hash", "0" * 64)
+                    )[::-1]
+                    merkle_root = bytes.fromhex(header.get("merkle_root", "0" * 64))[
+                        ::-1
+                    ]
                     header_bytes = (
-                        struct.pack('<I', version) +
-                        prev_block_hash +
-                        merkle_root +
-                        struct.pack('<I', header.get('timestamp', 0)) +
-                        struct.pack('<I', header.get('bits', 0)) +
-                        struct.pack('<I', header.get('nonce', 0))
+                        struct.pack("<I", version)
+                        + prev_block_hash
+                        + merkle_root
+                        + struct.pack("<I", header.get("timestamp", 0))
+                        + struct.pack("<I", header.get("bits", 0))
+                        + struct.pack("<I", header.get("nonce", 0))
                     )
-                    if calculate_block_hash(header_bytes).lower() == target_hash.lower():
+                    if (
+                        calculate_block_hash(header_bytes).lower()
+                        == target_hash.lower()
+                    ):
                         return blk_block
-        
+
         # Fall back to scanning blk files
         blk_files = self._get_blk_files()
-        
+
         for blk_file in blk_files:
             try:
                 # Read blocks from this file
@@ -528,95 +593,109 @@ class BLKFileReader:
                     xor_key=self.xor_key,
                     start_block_index=0,
                     shutdown_check=self.shutdown_check,
-                    target_height=target_height
+                    target_height=target_height,
                 )
-                
+
                 for blk_block in blocks:
                     # Calculate block hash from header
-                    header = blk_block.get('header', {})
-                    version = header.get('version', 0)
-                    prev_block_hash = bytes.fromhex(header.get('prev_block_hash', '0' * 64))[::-1]
-                    merkle_root = bytes.fromhex(header.get('merkle_root', '0' * 64))[::-1]
-                    timestamp_int = header.get('timestamp', 0)
-                    bits = header.get('bits', 0)
-                    nonce = header.get('nonce', 0)
-                    
+                    header = blk_block.get("header", {})
+                    version = header.get("version", 0)
+                    prev_block_hash = bytes.fromhex(
+                        header.get("prev_block_hash", "0" * 64)
+                    )[::-1]
+                    merkle_root = bytes.fromhex(header.get("merkle_root", "0" * 64))[
+                        ::-1
+                    ]
+                    timestamp_int = header.get("timestamp", 0)
+                    bits = header.get("bits", 0)
+                    nonce = header.get("nonce", 0)
+
                     header_bytes = (
-                        struct.pack('<I', version) +
-                        prev_block_hash +
-                        merkle_root +
-                        struct.pack('<I', timestamp_int) +
-                        struct.pack('<I', bits) +
-                        struct.pack('<I', nonce)
+                        struct.pack("<I", version)
+                        + prev_block_hash
+                        + merkle_root
+                        + struct.pack("<I", timestamp_int)
+                        + struct.pack("<I", bits)
+                        + struct.pack("<I", nonce)
                     )
                     block_hash = calculate_block_hash(header_bytes)
-                    
+
                     # Compare hashes (both should be in normal display order)
                     if block_hash.lower() == target_hash.lower():
                         return blk_block
 
                 # Block not in this file; try next (blocks are in arrival order, not height order)
                 if target_height is not None:
-                    print(f"BLK: height {target_height} not in {os.path.basename(blk_file)}, trying next file")
-                        
+                    print(
+                        f"BLK: height {target_height} not in {os.path.basename(blk_file)}, trying next file"
+                    )
+
             except ShutdownRequested:
                 raise
             except Exception as e:
                 print(f"Error scanning {blk_file} for block {target_hash}: {e}")
                 continue
-        
+
         return None
-    
+
     def fetch_blocks(self, heights: List[int]) -> Dict[int, Dict[str, Any]]:
         """
         Fetch blocks from BLK files.
         Uses RPC minimally to get block hashes, then finds blocks in BLK files.
-        
+
         Args:
             heights: List of block heights to fetch
-        
+
         Returns:
             Dictionary mapping height -> block dict (RPC format)
         """
         if not heights:
             return {}
-        
+
         height_min, height_max = min(heights), max(heights)
         print(f"BLK: reading heights {height_min}-{height_max} ({len(heights)} blocks)")
         result = {}
 
         # Step 1: Get block hashes via RPC (minimal RPC usage)
         if not self.rpc_batch_call:
-            raise ValueError("BLKFileReader requires rpc_batch_call for getting block hashes")
-        
+            raise ValueError(
+                "BLKFileReader requires rpc_batch_call for getting block hashes"
+            )
+
         try:
-            hash_batch_requests = [("getblockhash", [height], height) for height in heights]
+            hash_batch_requests = [
+                ("getblockhash", [height], height) for height in heights
+            ]
             hash_results = self.rpc_batch_call(hash_batch_requests)
         except Exception as e:
             raise RuntimeError(f"Failed to get block hashes via RPC: {e}")
-        
+
         # Step 2: Find blocks in BLK files by matching hash
         blk_files = self._get_blk_files()
         if not blk_files:
             raise ValueError(f"No blk*.dat files found in {self.blocks_dir}")
-        
+
         for height in heights:
             if height not in hash_results:
                 print(f"Warning: Could not get hash for block {height}")
                 continue
-            
+
             target_hash = hash_results[height]
-            
+
             # Find block in BLK files
             blk_block = self._find_block_by_hash(target_hash, target_height=height)
-            
+
             if blk_block:
                 # Convert BLK format to RPC format
                 rpc_block = convert_blk_to_rpc_format(blk_block, height)
-                rpc_block['hash'] = target_hash  # Ensure hash matches
+                rpc_block["hash"] = target_hash  # Ensure hash matches
                 result[height] = rpc_block
             else:
-                print(f"Warning: Block {height} (hash: {target_hash}) not found in BLK files")
+                print(
+                    f"Warning: Block {height} (hash: {target_hash}) not found in BLK files"
+                )
 
-        print(f"BLK: read {len(result)}/{len(heights)} blocks (heights {height_min}-{height_max})")
+        print(
+            f"BLK: read {len(result)}/{len(heights)} blocks (heights {height_min}-{height_max})"
+        )
         return result

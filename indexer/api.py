@@ -15,6 +15,7 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
+
 @app.get("/stats/overview")
 def stats_overview():
     try:
@@ -22,18 +23,29 @@ def stats_overview():
             # Get all stats from stats table
             cur.execute("SELECT key, value FROM stats")
             stats_rows = cur.fetchall()
-            
+
             # Initialize stats dictionary
             stats_dict = {}
             for row in stats_rows:
                 stats_dict[row["key"]] = int(row["value"])
-            
+
             # Get total_utxo count
             utxo_count = stats_dict.get("total_utxo", 0)
-            
+
             # Get all script type counts
             script_type_counts = {}
-            script_types = ["P2TR", "P2WPKH", "P2PKH", "P2SH", "P2MS", "P2WSH", "P2PK", "P2PR", "unknown", "Bech32"]
+            script_types = [
+                "P2TR",
+                "P2WPKH",
+                "P2PKH",
+                "P2SH",
+                "P2MS",
+                "P2WSH",
+                "P2PK",
+                "P2PR",
+                "unknown",
+                "Bech32",
+            ]
             for script_type in script_types:
                 key = f"{script_type}_count"
                 if key in stats_dict:
@@ -69,15 +81,22 @@ def stats_overview():
 
             # Get address count from the latest block
             if latest_block_height is not None:
-                cur.execute("""
+                cur.execute(
+                    """
                     SELECT COUNT(DISTINCT address)::bigint AS address_count
                     FROM utxos
                     WHERE address IS NOT NULL 
                       AND address <> ''
                       AND created_block = %s
-                """, (latest_block_height,))
+                """,
+                    (latest_block_height,),
+                )
                 address_row = cur.fetchone()
-                address_count = int(address_row["address_count"]) if address_row and address_row["address_count"] else 0
+                address_count = (
+                    int(address_row["address_count"])
+                    if address_row and address_row["address_count"]
+                    else 0
+                )
             else:
                 address_count = 0
 
@@ -91,6 +110,7 @@ def stats_overview():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/stats/supply")
 def stats_supply():
     """Return total supply and balance_sat for each script type from the stats table."""
@@ -99,15 +119,15 @@ def stats_supply():
             # Get all stats from stats table
             cur.execute("SELECT key, value FROM stats")
             stats_rows = cur.fetchall()
-            
+
             # Initialize stats dictionary
             stats_dict = {}
             for row in stats_rows:
                 stats_dict[row["key"]] = int(row["value"])
-            
+
             # Get total supply (total_balance_sat)
             total_supply_sat = stats_dict.get("total_balance_sat", 0)
-            
+
             # Get all script type balances (keys ending with _balance_sat, excluding total_balance_sat)
             script_type_balances = {}
             for key, value in stats_dict.items():
@@ -115,7 +135,7 @@ def stats_supply():
                     # Extract script type by removing "_balance_sat" suffix
                     script_type = key[:-12]  # Remove "_balance_sat" (13 characters)
                     script_type_balances[script_type] = value
-            
+
             return {
                 "total_supply_sat": total_supply_sat,
                 "script_type_balances": script_type_balances,
@@ -153,7 +173,9 @@ def address_status_list(
             if where_clauses:
                 where_sql = " WHERE " + " AND ".join(where_clauses)
 
-            count_sql = f"SELECT COUNT(*)::bigint AS total FROM address_status{where_sql}"
+            count_sql = (
+                f"SELECT COUNT(*)::bigint AS total FROM address_status{where_sql}"
+            )
             cur.execute(count_sql, params)
             total = int(cur.fetchone()["total"])
 
@@ -205,6 +227,7 @@ def address_stats():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/search")
 def search(q: str = Query(..., min_length=1)):
     results = []
@@ -217,15 +240,20 @@ def search(q: str = Query(..., min_length=1)):
                 WHERE id = 1
             """)
             global_stats = cur.fetchone()
-            max_balance_sat = global_stats['biggest_balance'] if global_stats and global_stats['biggest_balance'] else 0
-            
+            max_balance_sat = (
+                global_stats["biggest_balance"]
+                if global_stats and global_stats["biggest_balance"]
+                else 0
+            )
+
             # Set newest block as constant for age score calculation
             newest_block = 940000
 
             # Search for address - uses address_status table
             # Optimized to use primary key index on address column
             # Includes UTXO count from utxos table
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT
                     as_table.address,
                     as_table.script_pub_type,
@@ -239,54 +267,65 @@ def search(q: str = Query(..., min_length=1)):
                 WHERE as_table.address = %s
                 GROUP BY as_table.address, as_table.script_pub_type, as_table.reused, 
                          as_table.created_block, as_table.created_block_timestamp, as_table.balance_sat
-            """, (q,))
+            """,
+                (q,),
+            )
             for row in cur.fetchall():
-                row['source'] = 'address_status'
-                
+                row["source"] = "address_status"
+
                 # Calculate address risk score
-                address_balance = row['balance_sat'] or 0
-                address_block = row['created_block'] or 0
-                
+                address_balance = row["balance_sat"] or 0
+                address_block = row["created_block"] or 0
+
                 # Balance score: biggest address = 10
                 if max_balance_sat > 0:
-                    balance_score = min(10.0, (address_balance / max_balance_sat) * 10.0)
+                    balance_score = min(
+                        10.0, (address_balance / max_balance_sat) * 10.0
+                    )
                 else:
                     balance_score = 0.0
-                
+
                 # Age score: based on address block relative to newest block
                 # Formula: (address_block / newest_block) * 10
                 age_score = (1 - (address_block / newest_block)) * 10.0
                 age_score = max(0.0, min(10.0, age_score))  # Clamp between 0 and 10
-                
+
                 # Combined risk score: average of balance and age (0-10)
                 risk_score = (balance_score + age_score) / 2.0
                 risk_score = max(0.0, min(10.0, risk_score))  # Clamp between 0 and 10
-                
-                row['balance_risk_score'] = round(balance_score, 2)
-                row['age_risk_score'] = round(age_score, 2)
-                row['risk_score'] = round(risk_score, 2)
+
+                row["balance_risk_score"] = round(balance_score, 2)
+                row["age_risk_score"] = round(age_score, 2)
+                row["risk_score"] = round(risk_score, 2)
                 results.append(row)
 
             # Search utxos for txid (as created transaction) - uses PRIMARY KEY index on (txid, vout)
             # This query uses the primary key index efficiently
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT * 
                 FROM utxos 
                 WHERE txid = %s
                 ORDER BY vout ASC
-            """, (q,))
+            """,
+                (q,),
+            )
             for row in cur.fetchall():
-                row['source'] = 'utxos'
+                row["source"] = "utxos"
                 results.append(row)
 
         return {"results": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/latest/utxos")
 def latest_utxos(
     limit: int = Query(20, ge=1, le=100),
-    spent: bool = Query(None, description="Filter by spent status (true for spent, false for unspent, null for all)")
+    spent: bool = Query(
+        None,
+        description="Filter by spent status (true for spent, false for unspent, null for all)",
+    ),
 ):
     """Return the most recent UTXOs created.
     Optionally filter by spent status.
@@ -295,41 +334,51 @@ def latest_utxos(
     try:
         with db.get_db_cursor(cursor_factory=RealDictCursor) as cur:
             if spent is not None:
-                cur.execute("""
+                cur.execute(
+                    """
                     SELECT *
                     FROM utxos
                     WHERE spent = %s
                     ORDER BY created_block DESC, created_block_timestamp DESC
                     LIMIT %s
-                """, (spent, limit))
+                """,
+                    (spent, limit),
+                )
             else:
-                cur.execute("""
+                cur.execute(
+                    """
                     SELECT *
                     FROM utxos
                     ORDER BY created_block DESC, created_block_timestamp DESC
                     LIMIT %s
-                """, (limit,))
+                """,
+                    (limit,),
+                )
             rows = cur.fetchall()
         return {"results": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/latest/blocks")
 def latest_blocks(limit: int = Query(20, ge=1, le=100)):
-    """Return the most recent blocks scanned.
-    """
+    """Return the most recent blocks scanned."""
     try:
         with db.get_db_cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT *
                 FROM block_log
                 ORDER BY block_height DESC
                 LIMIT %s
-            """, (limit,))
+            """,
+                (limit,),
+            )
             rows = cur.fetchall()
         return {"results": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/latest/addresses")
 def latest_addresses(limit: int = Query(150, ge=1, le=1000)):
@@ -338,7 +387,8 @@ def latest_addresses(limit: int = Query(150, ge=1, le=1000)):
     """
     try:
         with db.get_db_cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT
                     address,
                     script_pub_type,
@@ -349,11 +399,14 @@ def latest_addresses(limit: int = Query(150, ge=1, le=1000)):
                 FROM address_status
                 ORDER BY created_block DESC, created_block_timestamp DESC
                 LIMIT %s
-            """, (limit,))
+            """,
+                (limit,),
+            )
             rows = cur.fetchall()
         return {"results": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/address")
 def address_utxo_stats(q: str = Query(..., min_length=1)):
@@ -363,7 +416,8 @@ def address_utxo_stats(q: str = Query(..., min_length=1)):
     """
     try:
         with db.get_db_cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT
                   address,
                   COUNT(*) AS total_utxos,
@@ -379,11 +433,15 @@ def address_utxo_stats(q: str = Query(..., min_length=1)):
                    AND COUNT(*) FILTER (WHERE spent) >= 1
                    AND COUNT(*) FILTER (WHERE NOT spent) >= 1
                 LIMIT 1;
-            """, (q,))
+            """,
+                (q,),
+            )
             row = cur.fetchone()
             if row:
                 return row
             else:
-                raise HTTPException(status_code=404, detail=f"No stats found for address: {q}")
+                raise HTTPException(
+                    status_code=404, detail=f"No stats found for address: {q}"
+                )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
