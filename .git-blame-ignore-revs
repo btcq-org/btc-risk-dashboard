@@ -1,0 +1,5 @@
+# Formatting-only commits; use with `git blame --ignore-revs-file .git-blame-ignore-revs`
+# (GitHub picks this file up automatically).
+
+# Apply ruff format to the whole repo
+4e02ccf06aa107035d67807c797ccd1b29af7065
