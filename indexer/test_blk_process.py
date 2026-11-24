@@ -8,11 +8,13 @@ Requires:
   - BLOCKS_DIR pointing to the blocks directory (e.g. /path/to/data-bitcoin/blocks)
     containing blk*.dat with at least the first 100 blocks.
 
+Marked `integration`, so a plain `pytest` (and CI) leaves it out.
+
 Run:
-  BLOCKS_DIR=/path/to/blocks pytest indexer/test_blk_first_100.py -v
+  BLOCKS_DIR=/path/to/blocks pytest -m integration indexer/test_blk_process.py -v
   # Fewer blocks for a quick run (default 100):
-  BLK_TEST_N_BLOCKS=5 BLOCKS_DIR=/path/to/blocks pytest indexer/test_blk_first_100.py -v
-  python -m indexer.test_blk_first_100
+  BLK_TEST_N_BLOCKS=5 BLOCKS_DIR=/path/to/blocks pytest -m integration indexer/test_blk_process.py -v
+  python -m indexer.test_blk_process
 """
 import os
 import sys
@@ -100,6 +102,7 @@ def _can_run_integration():
 
 
 if pytest:
+    pytestmark = pytest.mark.integration
 
     @pytest.fixture(scope="module")
     def rpc_blocks():
@@ -226,7 +229,7 @@ def main():
     """Run the same checks as a script (no pytest)."""
     if not _can_run_integration():
         print("Skipping: set BLOCKS_DIR and ensure Bitcoin RPC has at least 100 blocks.")
-        print("  Example: BLOCKS_DIR=/root/data-bitcoin/blocks python -m indexer.test_blk_first_100")
+        print("  Example: BLOCKS_DIR=/root/data-bitcoin/blocks python -m indexer.test_blk_process")
         sys.exit(0)
 
     from .block_reader import BLKFileReader

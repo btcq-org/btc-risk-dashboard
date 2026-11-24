@@ -4,7 +4,6 @@ import time
 import random
 import secrets
 import string
-import io  # For COPY variant
 
 def generate_fake_utxo(i):
     """Generate a single fake UTXO row as a tuple."""
